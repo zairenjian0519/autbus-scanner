@@ -19,6 +19,8 @@ interface DeviceState {
   networkInterfaces: NetworkInterface[];
   selectedInterface: NetworkInterface | null;
   opcuaConnections: OPCUAConnection[];
+  // 添加定时器管理
+  variablePollingTimers: Map<string, NodeJS.Timeout>; // deviceId -> timer
 
   setDevices: (devices: AUTBUSDevice[]) => void;
   addDevice: (device: AUTBUSDevice) => void;
@@ -35,6 +37,10 @@ interface DeviceState {
   updateOPCUAConnection: (deviceId: string, updates: Partial<OPCUAConnection>) => void;
   removeOPCUAConnection: (deviceId: string) => void;
   getOPCUAConnection: (deviceId: string) => OPCUAConnection | undefined;
+  // 添加定时器相关方法
+  addVariablePollingTimer: (deviceId: string, timer: NodeJS.Timeout) => void;
+  removeVariablePollingTimer: (deviceId: string) => void;
+  clearAllVariablePollingTimers: () => void;
 }
 
 const generateMockDevices = (): AUTBUSDevice[] => {
@@ -156,6 +162,7 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
   networkInterfaces: [],
   selectedInterface: null,
   opcuaConnections: [],
+  variablePollingTimers: new Map<string, NodeJS.Timeout>(),
 
   setDevices: (devices) => set({ devices }),
 
@@ -182,7 +189,12 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
 
   setIsScanning: (scanning) => set({ isScanning: scanning }),
 
-  clearDevices: () => set({ devices: [], selectedDevice: null, opcuaConnections: [] }),
+  clearDevices: () => {
+    // 清除所有定时器
+    const state = get();
+    state.variablePollingTimers.forEach((timer) => clearInterval(timer));
+    set({ devices: [], selectedDevice: null, opcuaConnections: [], variablePollingTimers: new Map() });
+  },
 
   getDeviceById: (id) => {
     const searchDevice = (devices: AUTBUSDevice[]): AUTBUSDevice | undefined => {
@@ -240,7 +252,29 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
 
   getOPCUAConnection: (deviceId) => {
     return get().opcuaConnections.find(c => c.deviceId === deviceId);
-  }
+  },
+
+  // 定时器相关方法
+  addVariablePollingTimer: (deviceId, timer) => set((state) => {
+    const timers = new Map(state.variablePollingTimers);
+    timers.set(deviceId, timer);
+    return { variablePollingTimers: timers };
+  }),
+
+  removeVariablePollingTimer: (deviceId) => set((state) => {
+    const timers = new Map(state.variablePollingTimers);
+    const timer = timers.get(deviceId);
+    if (timer) {
+      clearInterval(timer);
+      timers.delete(deviceId);
+    }
+    return { variablePollingTimers: timers };
+  }),
+
+  clearAllVariablePollingTimers: () => set((state) => {
+    state.variablePollingTimers.forEach((timer) => clearInterval(timer));
+    return { variablePollingTimers: new Map() };
+  })
 }));
 
 export const useDiscoveryService = () => {
@@ -303,6 +337,60 @@ export const useDiscoveryService = () => {
           status: 'connected',
           nodes: connection.nodes
         });
+
+        // 连接成功后执行browse操作获取所有数据建模
+        const browsedNodes = await opcuaService.browseNodes(deviceId);
+        if (browsedNodes.length > 0) {
+          // 更新节点数据
+          useDeviceStore.getState().updateOPCUAConnection(deviceId, { nodes: browsedNodes });
+          console.log(`设备 ${deviceId} 浏览节点完成，发现 ${browsedNodes.length} 个根节点`);
+        }
+
+        // 设置定时查询变量节点数据的定时器（5秒周期）
+        const pollInterval = 5000; // 5秒
+        const timer = setInterval(async () => {
+          try {
+            const opcuaConn = useDeviceStore.getState().getOPCUAConnection(deviceId);
+            if (opcuaConn && opcuaConn.status === 'connected') {
+              // 遍历所有节点，找出变量节点并更新其值
+              const updateVariableNode = async (node: any) => {
+                if (node.nodeClass === 'Variable') {
+                  try {
+                    // 读取变量节点的最新值
+                    const result = await opcuaService.readNodeValue(node.nodeId, deviceId);
+                    if (result && result.value !== undefined) {
+                      // 更新节点值
+                      node.value = result.value;
+                      console.log(`更新节点值: ${node.browseName} = ${result.value}`);
+                    }
+                  } catch (readError) {
+                    console.error(`读取节点 ${node.nodeId} 值失败:`, readError);
+                  }
+                }
+                // 递归处理子节点
+                if (node.children && node.children.length > 0) {
+                  for (const childNode of node.children) {
+                    await updateVariableNode(childNode);
+                  }
+                }
+              };
+
+              // 遍历所有根节点
+              for (const rootNode of opcuaConn.nodes) {
+                await updateVariableNode(rootNode);
+              }
+
+              // 更新连接信息中的节点数据
+              useDeviceStore.getState().updateOPCUAConnection(deviceId, { nodes: opcuaConn.nodes });
+            }
+          } catch (error) {
+            console.error(`定时查询设备 ${deviceId} 变量节点失败:`, error);
+          }
+        }, pollInterval);
+
+        // 保存定时器引用，以便后续清理
+        useDeviceStore.getState().addVariablePollingTimer(deviceId, timer);
+        console.log(`设备 ${deviceId} 定时查询已启动，周期 ${pollInterval}ms`);
       } catch (error) {
         console.error('连接设备失败:', error);
         useDeviceStore.getState().updateDevice(deviceId, { status: 'offline' });
@@ -318,9 +406,14 @@ export const useDiscoveryService = () => {
 
   const disconnectDevice = async (deviceId: string) => {
     try {
+      // 清除定时器
+      useDeviceStore.getState().removeVariablePollingTimer(deviceId);
+      
       await opcuaService.disconnect(deviceId);
       useDeviceStore.getState().updateDevice(deviceId, { status: 'offline' });
       useDeviceStore.getState().removeOPCUAConnection(deviceId);
+      
+      console.log(`设备 ${deviceId} 已断开连接，定时器已清理`);
     } catch (error) {
       console.error('断开设备连接失败:', error);
     }

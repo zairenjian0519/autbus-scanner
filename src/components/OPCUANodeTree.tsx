@@ -32,6 +32,35 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
     }
   }, [selectedDevice]);
 
+  // 监听nodes变化，自动更新选中节点的信息
+  useEffect(() => {
+    if (selectedNode) {
+      // 递归查找节点的最新数据
+      const findNode = (nodeList: OPCUANode[], targetNodeId: string): OPCUANode | null => {
+        for (const node of nodeList) {
+          if (node.nodeId === targetNodeId) {
+            return node;
+          }
+          if (node.children && node.children.length > 0) {
+            const found = findNode(node.children, targetNodeId);
+            if (found) {
+              return found;
+            }
+          }
+        }
+        return null;
+      };
+
+      // 查找最新的节点数据
+      const updatedNode = findNode(nodes, selectedNode.nodeId);
+      if (updatedNode) {
+        setSelectedNode(updatedNode);
+        setEditValue(updatedNode.value);
+        console.log(`节点 ${updatedNode.browseName} 的数据已更新: ${updatedNode.value}`);
+      }
+    }
+  }, [nodes, selectedNode]);
+
   const getNodeIcon = (nodeClass: string) => {
     switch (nodeClass) {
       case 'Object':

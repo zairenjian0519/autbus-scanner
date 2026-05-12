@@ -150,7 +150,7 @@ export class OPCUAService {
   }
 
   // 读取节点值
-  async readNodeValue(nodeId: string, deviceId?: string): Promise<any> {
+  async readNodeValue(nodeId: string, deviceId?: string): Promise<{ value: any; displayName?: string }> {
     console.log(`读取节点值: ${nodeId}`);
 
     try {
@@ -164,7 +164,10 @@ export class OPCUAService {
       console.log('读取节点值响应:', result);
       
       if (result.value !== undefined) {
-        return result.value;
+        return {
+          value: result.value,
+          displayName: result.displayName
+        };
       } else {
         throw new Error(result.errorMessage || '读取失败');
       }
@@ -175,7 +178,7 @@ export class OPCUAService {
   }
 
   // 写入节点值
-  async writeNodeValue(nodeId: string, value: any, deviceId?: string): Promise<any> {
+  async writeNodeValue(nodeId: string, value: any, deviceId?: string): Promise<{ value: any; displayName?: string }> {
     console.log(`写入节点值: ${nodeId} = ${value}`);
 
     try {
@@ -187,7 +190,10 @@ export class OPCUAService {
 
       const result = await response.result;
       console.log('写入操作响应:', result);
-      return result;
+      return {
+        value: result.value,
+        displayName: result.displayName
+      };
     } catch (error) {
       console.error('写入节点值失败:', error);
       throw error;

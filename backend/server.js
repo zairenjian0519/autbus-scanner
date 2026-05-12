@@ -16,6 +16,8 @@ console.log(`WebSocket server started on port ${CONFIG.WS_PORT}`);
 
 // 存储OPC UA连接
 const opcuaConnections = new Map();
+// 存储OPC UA服务器模型数据（deviceId -> nodes）
+const opcuaModels = new Map();
 
 // 创建UDP套接字
 const udpSocket = dgram.createSocket('udp6');
@@ -185,6 +187,12 @@ wss.on('connection', (ws) => {
             // 浏览节点
             const nodes = await browseNodes(session);
             
+            // 保存模型数据
+            opcuaModels.set(deviceId, nodes);
+            console.log(`保存了设备 ${deviceId} 的OPC UA模型数据，包含 ${nodes.length} 个根节点`);
+            // 打印模型数据结构（前500个字符）
+            console.log(`模型数据摘要: ${JSON.stringify(nodes).substring(0, 500)}...`);
+            
             // 返回连接结果
             ws.send(JSON.stringify({
               type: 'opcua-connect-complete',
@@ -216,7 +224,9 @@ wss.on('connection', (ws) => {
               await connection.session.close();
               await connection.client.disconnect();
               opcuaConnections.delete(disconnectDeviceId);
-              console.log('OPC UA连接已断开');
+              // 清理模型数据
+              opcuaModels.delete(disconnectDeviceId);
+              console.log('OPC UA连接已断开，模型数据已清理');
             }
             ws.send(JSON.stringify({
               type: 'opcua-disconnect-complete',
@@ -251,20 +261,36 @@ wss.on('connection', (ws) => {
             const resolvedNodeId = resolveNodeId(nodeId);
             console.log('解析后的 NodeId:', resolvedNodeId);
             
-            const result = await connection.session.read([{
-              nodeId: resolvedNodeId,
-              attributeId: 13 // Value attribute
-            }]);
+            // 先从模型中获取显示名称
+            let displayName = getDisplayNameFromModel(readDeviceId, nodeId);
+            
+            // 读取节点值（如果没有从模型中获取到显示名称，再读取DisplayName属性）
+            const attributesToRead = [
+              { nodeId: resolvedNodeId, attributeId: 13 } // Value attribute
+            ];
+            
+            if (!displayName) {
+              attributesToRead.push({ nodeId: resolvedNodeId, attributeId: 3 }); // DisplayName attribute
+            }
+            
+            const result = await connection.session.read(attributesToRead);
             
             const value = result[0].value.value;
-            console.log('读取节点值成功:', value);
+            
+            // 如果没有从模型中获取到显示名称，则使用服务器返回的
+            if (!displayName && result.length > 1 && result[1].value && result[1].value.value) {
+              displayName = result[1].value.value.text;
+            }
+            
+            console.log(`读取节点值成功: ${value}, 显示名称: ${displayName}`);
             
             ws.send(JSON.stringify({
               type: 'opcua-read-complete',
               requestId: data.requestId, // 包含requestId，以便前端能够正确处理响应
               deviceId: readDeviceId,
               nodeId,
-              value
+              value,
+              displayName
             }));
           } catch (error) {
             console.error('读取节点值失败:', error);
@@ -374,17 +400,34 @@ wss.on('connection', (ws) => {
           }
           
           // 无论成功失败，都重新读取最新值
+          let finalDisplayName = null;
           try {
             if (connection && resolvedNodeId) {
               console.log('重新读取节点最新值...');
-              const verifyRead = await connection.session.read([{
-                nodeId: resolvedNodeId,
-                attributeId: 13
-              }]);
+              
+              // 先从模型中获取显示名称
+              finalDisplayName = getDisplayNameFromModel(writeDeviceId, writeNodeId);
+              
+              // 读取节点值（如果没有从模型中获取到显示名称，再读取DisplayName属性）
+              const attributesToRead = [
+                { nodeId: resolvedNodeId, attributeId: 13 } // Value attribute
+              ];
+              
+              if (!finalDisplayName) {
+                attributesToRead.push({ nodeId: resolvedNodeId, attributeId: 3 }); // DisplayName attribute
+              }
+              
+              const verifyRead = await connection.session.read(attributesToRead);
               
               if (verifyRead && verifyRead[0] && verifyRead[0].value) {
                 finalValue = verifyRead[0].value.value;
                 console.log('读取到的最新值:', finalValue);
+              }
+              
+              // 如果没有从模型中获取到显示名称，则使用服务器返回的
+              if (!finalDisplayName && verifyRead.length > 1 && verifyRead[1].value && verifyRead[1].value.value) {
+                finalDisplayName = verifyRead[1].value.value.text;
+                console.log('读取到的显示名称:', finalDisplayName);
               }
             }
           } catch (readError) {
@@ -399,6 +442,7 @@ wss.on('connection', (ws) => {
             nodeId: writeNodeId,
             status: finalValue !== null ? 'success' : 'error',
             value: finalValue,
+            displayName: finalDisplayName,
             errorMessage: finalValue !== null ? undefined : '读取值失败'
           }));
           
@@ -435,6 +479,96 @@ function bytesToIpv6(bytes) {
     parts.push(((bytes[i * 2] << 8) | bytes[i * 2 + 1]).toString(16));
   }
   return parts.join(':');
+}
+
+// 辅助函数：规范化NodeId（处理大小写、GUID格式等）
+function normalizeNodeId(nodeId) {
+  if (typeof nodeId !== 'string') return nodeId;
+  
+  // 转换为小写
+  let normalized = nodeId.toLowerCase();
+  
+  // 检查是否是GUID格式的NodeId
+  if (normalized.startsWith('ns=1;g=')) {
+    const guidPart = normalized.substring(6);
+    // 移除GUID中的分隔符（-）以进行更宽松的比较
+    const strippedGuid = guidPart.replace(/-/g, '');
+    return strippedGuid;
+  }
+  
+  return normalized;
+}
+
+// 辅助函数：从模型中查找节点
+function findNodeInModel(nodes, targetNodeId) {
+  for (const node of nodes) {
+    // 规范化比较
+    const normalizedNodeId = normalizeNodeId(node.nodeId);
+    const normalizedTargetId = normalizeNodeId(targetNodeId);
+    
+    console.log(`比较节点: ${node.nodeId} (规范化: ${normalizedNodeId}) 与目标: ${targetNodeId} (规范化: ${normalizedTargetId})`);
+    
+    if (normalizedNodeId === normalizedTargetId) {
+      console.log(`找到匹配的节点: ${node.nodeId}, 显示名称: ${node.displayName}`);
+      return node;
+    }
+    
+    // 也尝试直接比较（防止规范化导致的问题）
+    if (node.nodeId === targetNodeId || node.nodeId.toLowerCase() === targetNodeId.toLowerCase()) {
+      console.log(`找到匹配的节点（直接比较）: ${node.nodeId}, 显示名称: ${node.displayName}`);
+      return node;
+    }
+    
+    if (node.children && node.children.length > 0) {
+      console.log(`递归查找子节点: ${node.nodeId} 有 ${node.children.length} 个子节点`);
+      const found = findNodeInModel(node.children, targetNodeId);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  console.log(`未找到节点: ${targetNodeId}`);
+  return null;
+}
+
+// 辅助函数：从保存的模型中获取显示名称
+function getDisplayNameFromModel(deviceId, nodeId) {
+  console.log(`从模型中获取显示名称 - DeviceId: ${deviceId}, NodeId: ${nodeId}`);
+  const model = opcuaModels.get(deviceId);
+  if (!model) {
+    console.log(`未找到设备 ${deviceId} 的模型数据`);
+    return null;
+  }
+  console.log(`设备 ${deviceId} 的模型数据包含 ${model.length} 个根节点`);
+  
+  // 尝试直接查找
+  let node = findNodeInModel(model, nodeId);
+  
+  // 如果找不到，尝试转换为标准GUID格式
+  if (!node && nodeId.startsWith('ns=1;g=')) {
+    const guidPart = nodeId.substring(6);
+    console.log(`尝试转换GUID格式: ${guidPart}`);
+    
+    // 尝试不同的GUID格式变体
+    const guidVariants = [
+      guidPart, // 原始格式
+      guidPart.toUpperCase(), // 全大写
+      guidPart.toLowerCase(), // 全小写
+      guidPart.replace(/-/g, ''), // 移除分隔符
+      guidPart.toUpperCase().replace(/-/g, '') // 全大写并移除分隔符
+    ];
+    
+    for (const variant of guidVariants) {
+      const variantNodeId = `ns=1;g=${variant}`;
+      console.log(`尝试变体: ${variantNodeId}`);
+      node = findNodeInModel(model, variantNodeId);
+      if (node) break;
+    }
+  }
+  
+  const displayName = node ? node.displayName : null;
+  console.log(`获取到的显示名称: ${displayName}`);
+  return displayName;
 }
 
 // 错误处理
