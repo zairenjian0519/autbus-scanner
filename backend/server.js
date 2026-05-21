@@ -577,7 +577,7 @@ udpSocket.on('error', (error) => {
 });
 
 // 递归浏览节点
-async function recursiveBrowse(session, nodeId, depth = 0) {
+async function recursiveBrowse(session, nodeId, depth = 0, visitedNodeIds = new Set()) {
   try {
     const browseResult = await session.browse({
       nodeId: nodeId,
@@ -593,10 +593,18 @@ async function recursiveBrowse(session, nodeId, depth = 0) {
     console.log(`浏览节点 ${nodeId}，找到 ${browseResult.references.length} 个子节点`);
     
     for (const ref of browseResult.references) {
-      console.log(`  子节点: ${ref.browseName.name} (${ref.nodeClass}) nodeid(${ref.nodeId.toString()})`);
+      const childNodeId = ref.nodeId.toString();
+
+      if (visitedNodeIds.has(childNodeId)) {
+        console.log(`  跳过重复节点: ${ref.browseName.name} nodeid(${childNodeId})`);
+        continue;
+      }
+
+      visitedNodeIds.add(childNodeId);
+      console.log(`  子节点: ${ref.browseName.name} (${ref.nodeClass}) nodeid(${childNodeId})`);
       
       const childNode = {
-        nodeId: ref.nodeId.toString(),
+        nodeId: childNodeId,
         browseName: ref.browseName.name,
         displayName: ref.displayName.text || ref.browseName.name,
         nodeClass: ref.nodeClass.toString(),
@@ -648,7 +656,7 @@ async function recursiveBrowse(session, nodeId, depth = 0) {
       // 递归浏览子节点，限制深度以避免无限递归
       // 不仅对Object节点递归，也对其他可能有子节点的节点类型递归
       if (depth < 7) { // 深度小于5
-        childNode.children = await recursiveBrowse(session, ref.nodeId, depth + 1);
+        childNode.children = await recursiveBrowse(session, ref.nodeId, depth + 1, visitedNodeIds);
       }
 
       children.push(childNode);
@@ -664,32 +672,17 @@ async function recursiveBrowse(session, nodeId, depth = 0) {
 // 浏览OPC UA节点
 async function browseNodes(session) {
   try {
-    // 从根节点开始浏览
-    const rootNodeId = 'ns=0;i=84'; // Server节点
-    const objectsNodeId = 'ns=0;i=85'; // Objects节点
-
-    // 构建节点树
-    const nodes = [];
-
-    // 处理Server节点
-    const serverNode = {
-      nodeId: rootNodeId,
-      browseName: 'Server',
-      displayName: 'Server',
-      nodeClass: 'Object',
-      children: await recursiveBrowse(session, rootNodeId, 1)
-    };
-    nodes.push(serverNode);
-
-    // 处理Objects节点
-    const objectsNode = {
+    // 只从 Objects 文件夹建模。RootFolder(ns=0;i=84) 本身已经包含 Objects，
+    // 同时把两者作为根节点会让 Objects 子树在页面上重复出现。
+    const objectsNodeId = 'ns=0;i=85';
+    const visitedNodeIds = new Set([objectsNodeId]);
+    const nodes = [{
       nodeId: objectsNodeId,
       browseName: 'Objects',
       displayName: 'Objects',
       nodeClass: 'Object',
-      children: await recursiveBrowse(session, objectsNodeId, 1)
-    };
-    nodes.push(objectsNode);
+      children: await recursiveBrowse(session, objectsNodeId, 1, visitedNodeIds)
+    }];
 
     // 打印详细的节点信息
     console.log('=== OPC UA节点树 ===');

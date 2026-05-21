@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Tree, Card, Descriptions, Input, InputNumber, Switch, Button } from 'antd';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Tree, Card, Descriptions, Input, InputNumber, Switch, Button, Spin } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { FolderOutlined, FileOutlined, AppstoreOutlined, KeyOutlined } from '@ant-design/icons';
 import type { OPCUANode } from '../types/device';
@@ -12,12 +12,107 @@ interface OPCUANodeTreeProps {
   onNodeSelect?: (node: OPCUANode) => void;
 }
 
+type OPCUATreeDataNode = DataNode & {
+  key: string;
+  node: OPCUANode;
+  children?: OPCUATreeDataNode[];
+};
+
+const TREE_FONT_SIZE = 12;
+const DETAIL_FONT_SIZE = 13;
+const CODE_FONT_SIZE = 12;
+
+const nodeTreeCardStyle: React.CSSProperties = {
+  height: 'calc(100vh - 300px)',
+  minHeight: 760,
+  display: 'flex',
+  flexDirection: 'column',
+  fontSize: TREE_FONT_SIZE
+};
+
+const nodeTreeCardBodyStyle: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  padding: '12px 16px',
+  display: 'flex',
+  flexDirection: 'column'
+};
+
+const nodeTreeContentStyle: React.CSSProperties = {
+  flex: 1,
+  display: 'flex',
+  minHeight: 0,
+  overflow: 'hidden',
+  gap: 16
+};
+
+const treePaneStyle: React.CSSProperties = {
+  flex: '0 0 45%',
+  minWidth: 320,
+  borderRight: '1px solid #e8e8e8',
+  paddingRight: 16,
+  paddingBottom: 8,
+  overflow: 'auto',
+  fontSize: TREE_FONT_SIZE
+};
+
+const detailPaneStyle: React.CSSProperties = {
+  flex: '1 1 55%',
+  minWidth: 360,
+  overflowY: 'auto',
+  fontSize: DETAIL_FONT_SIZE
+};
+
+const treeNodeTitleStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  lineHeight: '22px',
+  fontSize: TREE_FONT_SIZE,
+  whiteSpace: 'nowrap'
+};
+
+const detailLabelStyle: React.CSSProperties = {
+  width: 104,
+  fontSize: DETAIL_FONT_SIZE,
+  fontWeight: 500,
+  color: '#4b5563'
+};
+
+const detailContentStyle: React.CSSProperties = {
+  fontSize: DETAIL_FONT_SIZE,
+  lineHeight: '21px',
+  color: '#1f2937'
+};
+
+const footerStyle: React.CSSProperties = {
+  borderTop: '1px solid #e8e8e8',
+  paddingTop: 8,
+  marginTop: 12,
+  backgroundColor: '#fff',
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  fontSize: TREE_FONT_SIZE
+};
+
+const footerButtonStyle: React.CSSProperties = {
+  padding: '3px 10px',
+  fontSize: TREE_FONT_SIZE,
+  lineHeight: '20px',
+  border: '1px solid #d9d9d9',
+  borderRadius: 4,
+  backgroundColor: '#fff',
+  cursor: 'pointer'
+};
+
 const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   nodes,
   loading = false,
   onNodeSelect
 }) => {
   const [selectedNode, setSelectedNode] = useState<OPCUANode | null>(null);
+  const [selectedNodeKey, setSelectedNodeKey] = useState<string | null>(null);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [editValue, setEditValue] = useState<any>(null);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
@@ -31,35 +126,6 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
       setCurrentDeviceId(selectedDevice.id);
     }
   }, [selectedDevice]);
-
-  // 监听nodes变化，自动更新选中节点的信息
-  useEffect(() => {
-    if (selectedNode) {
-      // 递归查找节点的最新数据
-      const findNode = (nodeList: OPCUANode[], targetNodeId: string): OPCUANode | null => {
-        for (const node of nodeList) {
-          if (node.nodeId === targetNodeId) {
-            return node;
-          }
-          if (node.children && node.children.length > 0) {
-            const found = findNode(node.children, targetNodeId);
-            if (found) {
-              return found;
-            }
-          }
-        }
-        return null;
-      };
-
-      // 查找最新的节点数据
-      const updatedNode = findNode(nodes, selectedNode.nodeId);
-      if (updatedNode) {
-        setSelectedNode(updatedNode);
-        setEditValue(updatedNode.value);
-        console.log(`节点 ${updatedNode.browseName} 的数据已更新: ${updatedNode.value}`);
-      }
-    }
-  }, [nodes, selectedNode]);
 
   const getNodeIcon = (nodeClass: string) => {
     switch (nodeClass) {
@@ -89,36 +155,79 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
 
   // 格式化 NodeId 为 IPv6 地址格式
   const formatNodeId = (nodeId: string): string => {
-    // 提取节点 ID 部分
-    const match = nodeId.match(/ns=\d+;i=(.*)/);
-    if (match) {
-      const id = match[1];
-      // 按照 IPv6 地址格式格式化
-      if (id.length === 32) {
-        const parts = [];
-        for (let i = 0; i < 8; i++) {
-          parts.push(id.substr(i * 4, 4));
-        }
-        return parts.join(':');
+    const formatHexToIPv6 = (value: string): string | null => {
+      const hex = value.replace(/-/g, '').toLowerCase();
+      if (!/^[0-9a-f]{32}$/.test(hex)) {
+        return null;
       }
+
+      const parts = [];
+      for (let i = 0; i < 8; i++) {
+        parts.push(hex.substring(i * 4, i * 4 + 4));
+      }
+      return parts.join(':');
+    };
+
+    // 支持 ns=1;g=2001EACA-0101-0000-001E-CD000201000B
+    const guidMatch = nodeId.match(/ns=\d+;g=([0-9a-fA-F-]{32,36})/);
+    if (guidMatch) {
+      return formatHexToIPv6(guidMatch[1]) || nodeId;
     }
+
+    // 兼容 ns=1;i=2001EACA01010000001ECD000201000B
+    const numericMatch = nodeId.match(/ns=\d+;i=([0-9a-fA-F]{32})/);
+    if (numericMatch) {
+      return formatHexToIPv6(numericMatch[1]) || nodeId;
+    }
+
     return nodeId;
   };
 
-  const convertToTreeData = (nodeList: OPCUANode[]): DataNode[] => {
-    return nodeList.map((node) => {
-      const treeNode: DataNode = {
-        key: node.nodeId,
+  const buildTreeKey = (node: OPCUANode, index: number, parentKey = ''): string => {
+    const pathPart = `${index}:${node.nodeId}`;
+    return parentKey ? `${parentKey}/${pathPart}` : pathPart;
+  };
+
+  const findNodeByTreeKey = (
+    nodeList: OPCUANode[],
+    targetKey: string,
+    parentKey = ''
+  ): OPCUANode | null => {
+    for (let index = 0; index < nodeList.length; index += 1) {
+      const node = nodeList[index];
+      const nodeKey = buildTreeKey(node, index, parentKey);
+      if (nodeKey === targetKey) {
+        return node;
+      }
+
+      if (node.children && node.children.length > 0) {
+        const found = findNodeByTreeKey(node.children, targetKey, nodeKey);
+        if (found) {
+          return found;
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const convertToTreeData = (nodeList: OPCUANode[], parentKey = ''): OPCUATreeDataNode[] => {
+    return nodeList.map((node, index) => {
+      const nodeKey = buildTreeKey(node, index, parentKey);
+      const treeNode: OPCUATreeDataNode = {
+        key: nodeKey,
         title: (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            {getNodeIcon(node.nodeClass)}
-            <span style={{ color: getNodeColor(node.nodeClass), fontSize: '9px' }}>
+          <div style={treeNodeTitleStyle}>
+            <span style={{ color: getNodeColor(node.nodeClass), display: 'inline-flex' }}>
+              {getNodeIcon(node.nodeClass)}
+            </span>
+            <span style={{ color: getNodeColor(node.nodeClass), fontSize: TREE_FONT_SIZE }}>
               {node.browseName}
             </span>
           </div>
         ),
         children: node.children && node.children.length > 0
-          ? convertToTreeData(node.children)
+          ? convertToTreeData(node.children, nodeKey)
           : undefined,
         isLeaf: !node.children || node.children.length === 0,
         node
@@ -127,19 +236,52 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
     });
   };
 
-  const treeData = convertToTreeData(nodes);
+  const treeData = useMemo(() => convertToTreeData(nodes), [nodes]);
+  const expandableKeys = useMemo(() => {
+    const keys: string[] = [];
+    const collectKeys = (treeNodes: OPCUATreeDataNode[]) => {
+      treeNodes.forEach((node) => {
+        if (node.children && node.children.length > 0 && typeof node.key === 'string') {
+          keys.push(node.key);
+          collectKeys(node.children);
+        }
+      });
+    };
 
-  const handleSelect = (selectedKeys: React.Key[], info: { node: DataNode }) => {
-    const node = info.node as DataNode & { node?: OPCUANode };
+    collectKeys(treeData);
+    return keys;
+  }, [treeData]);
+
+  // 监听nodes变化，自动更新选中节点的信息
+  useEffect(() => {
+    if (!selectedNodeKey) {
+      return;
+    }
+
+    const updatedNode = findNodeByTreeKey(nodes, selectedNodeKey);
+    if (updatedNode) {
+      setSelectedNode(updatedNode);
+      setEditValue(updatedNode.value);
+      console.log(`节点 ${updatedNode.browseName} 的数据已更新: ${updatedNode.value}`);
+    } else {
+      setSelectedNode(null);
+      setSelectedNodeKey(null);
+      setEditValue(null);
+    }
+  }, [nodes, selectedNodeKey]);
+
+  const handleSelect = (_selectedKeys: React.Key[], info: { node: DataNode }) => {
+    const node = info.node as OPCUATreeDataNode;
     if (node.node) {
       setSelectedNode(node.node);
+      setSelectedNodeKey(String(node.key));
       setEditValue(node.node.value);
       onNodeSelect?.(node.node);
     }
   };
 
   const handleExpand = (expandedKeys: React.Key[]) => {
-    setExpandedKeys(expandedKeys as string[]);
+    setExpandedKeys(expandedKeys.map(String));
   };
 
   // 处理值修改
@@ -229,7 +371,7 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
           value={editValue}
           onChange={handleValueChange}
           onKeyPress={(e) => handleKeyPress(e, node)}
-          style={{ width: '100%', fontSize: '8px' }}
+          style={{ width: '100%', fontSize: DETAIL_FONT_SIZE }}
         />
       );
     } else if (isBooleanType) {
@@ -240,7 +382,7 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
             onChange={handleValueChange}
             size="small"
           />
-          <span style={{ marginLeft: '8px', fontSize: '8px' }}>
+          <span style={{ marginLeft: 8, fontSize: DETAIL_FONT_SIZE }}>
             {editValue === true ? '开' : '关'}
           </span>
         </div>
@@ -254,7 +396,7 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
           value={editValue}
           onChange={(e) => handleValueChange(e.target.value)}
           onKeyPress={(e) => handleKeyPress(e, node)}
-          style={{ width: '100%', fontSize: '8px' }}
+          style={{ width: '100%', fontSize: DETAIL_FONT_SIZE }}
           placeholder="请输入新值"
         />
       );
@@ -268,7 +410,7 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
             type="primary" 
             size="small"
             onClick={() => handleSubmitValue(node)}
-            style={{ fontSize: '8px', padding: '4px 8px', alignSelf: 'flex-end' }}
+            style={{ fontSize: TREE_FONT_SIZE, padding: '4px 10px', alignSelf: 'flex-end' }}
           >
             确认修改
           </Button>
@@ -278,91 +420,71 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   };
 
   return (
-    <Card title="OPC UA 节点树" style={{ height: '600px', display: 'flex', flexDirection: 'column', fontSize: '9px' }}>
-      <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
-        <div style={{ flex: 1, borderRight: '1px solid #e8e8e8', paddingRight: 8, overflowY: 'auto', maxHeight: '550px', fontSize: '9px' }}>
-          <Tree
-            treeData={treeData}
-            onSelect={handleSelect}
-            onExpand={handleExpand}
-            expandedKeys={expandedKeys}
-            loading={loading}
-            showIcon={false}
-            defaultExpandAll
-            style={{ width: '100%', fontSize: '9px' }}
-          />
+    <Card title="AUTBUS 总线设备树" style={nodeTreeCardStyle} bodyStyle={nodeTreeCardBodyStyle}>
+      <div style={nodeTreeContentStyle}>
+        <div style={treePaneStyle}>
+          <Spin spinning={loading}>
+            <Tree
+              treeData={treeData}
+              onSelect={handleSelect}
+              onExpand={handleExpand}
+              expandedKeys={expandedKeys}
+              selectedKeys={selectedNodeKey ? [selectedNodeKey] : []}
+              showIcon={false}
+              defaultExpandAll
+              style={{ minWidth: 'max-content', fontSize: TREE_FONT_SIZE }}
+            />
+          </Spin>
         </div>
-        <div style={{ flex: 1, paddingLeft: 8, overflowY: 'auto', maxHeight: '550px', fontSize: '9px' }}>
+        <div style={detailPaneStyle}>
           {selectedNode ? (
             <>
-              <Descriptions title="节点信息" bordered size="small" style={{ fontSize: '9px' }}>
-                <Descriptions.Item label="NodeId" style={{ fontSize: '9px' }}>
-                  <code style={{ fontSize: '8px', wordBreak: 'break-all' }}>
+              <Descriptions title="设备信息" bordered size="small" column={1} style={{ fontSize: DETAIL_FONT_SIZE }}>
+                <Descriptions.Item label="设备地址" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
+                  <code style={{ fontSize: CODE_FONT_SIZE, wordBreak: 'break-all' }}>
                     {formatNodeId(selectedNode.nodeId)}
                   </code>
                 </Descriptions.Item>
-                <Descriptions.Item label="DisplayName" style={{ fontSize: '9px' }}>
+                <Descriptions.Item label="显示名称" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
                   {selectedNode.displayName}
                 </Descriptions.Item>
                 {selectedNode.dataType && (
-                  <Descriptions.Item label="DataType" style={{ fontSize: '9px' }}>
+                  <Descriptions.Item label="数据类型" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
                     {selectedNode.dataType}
                   </Descriptions.Item>
                 )}
-                <Descriptions.Item label="Value" style={{ fontSize: '9px' }}>
+                <Descriptions.Item label="当前值" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
                   {renderInputControl(selectedNode)}
                 </Descriptions.Item>
                 {selectedNode.accessLevel && (
-                  <Descriptions.Item label="AccessLevel" style={{ fontSize: '9px' }}>
+                  <Descriptions.Item label="访问级别" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
                     {selectedNode.accessLevel}
                   </Descriptions.Item>
                 )}
               </Descriptions>
             </>
           ) : (
-            <div style={{ textAlign: 'center', color: '#999', padding: '40px 0', fontSize: '9px' }}>
-              请选择一个节点查看详情
+            <div style={{ textAlign: 'center', color: '#999', padding: '48px 0', fontSize: DETAIL_FONT_SIZE }}>
+              请选择一个设备查看详情
             </div>
           )}
         </div>
       </div>
       {/* 任务栏形状的底部元素 */}
-      <div style={{
-        borderTop: '1px solid #e8e8e8',
-        padding: '6px',
-        backgroundColor: '#f5f5f5',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        fontSize: '8px'
-      }}>
-        <div style={{ fontSize: '8px', color: '#666' }}>
-          节点数: {treeData.length}
+      <div style={footerStyle}>
+        <div style={{ color: '#666' }}>
+          设备数: {treeData.length}
         </div>
-        <div style={{ display: 'flex', gap: '4px' }}>
+        <div style={{ display: 'flex', gap: 6 }}>
           <button 
-            style={{
-              padding: '2px 6px',
-              fontSize: '8px',
-              border: '1px solid #d9d9d9',
-              borderRadius: '3px',
-              backgroundColor: '#fff',
-              cursor: 'pointer'
-            }}
+            style={footerButtonStyle}
             onClick={() => setExpandedKeys([])}
           >
             折叠所有
           </button>
           <button 
-            style={{
-              padding: '2px 6px',
-              fontSize: '8px',
-              border: '1px solid #d9d9d9',
-              borderRadius: '3px',
-              backgroundColor: '#fff',
-              cursor: 'pointer'
-            }}
-            onClick={() => setExpandedKeys(treeData.map(node => node.key).filter(key => typeof key === 'string'))}
+            style={footerButtonStyle}
+            onClick={() => setExpandedKeys(expandableKeys)}
           >
             展开所有
           </button>

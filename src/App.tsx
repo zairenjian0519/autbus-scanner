@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { Layout, message, Button } from 'antd';
-import type { MenuProps } from 'antd';
 import { Header } from 'antd/es/layout/layout';
 import ScanButton from './components/ScanButton';
 import DeviceTree from './components/DeviceTree';
@@ -9,7 +8,7 @@ import ObjectDirectOperation from './components/ObjectDirectOperation';
 import { useDeviceStore } from './stores/deviceStore';
 import './index.css';
 
-const { Sider, Content } = Layout;
+const { Sider, Content, Footer } = Layout;
 
 const App: React.FC = () => {
   const { devices, selectedDevice, isScanning, setSelectedDevice } = useDeviceStore();
@@ -33,12 +32,13 @@ const App: React.FC = () => {
   };
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ height: '100vh', minHeight: '100vh' }}>
       <Header style={{
         background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
         padding: '0 24px',
         display: 'flex',
         alignItems: 'center',
+        flex: '0 0 64px',
         boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
       }}>
         <div style={{ color: 'white', fontSize: 20, fontWeight: 'bold' }}>
@@ -49,13 +49,12 @@ const App: React.FC = () => {
         </div>
       </Header>
 
-      <Layout>
+      <Layout style={{ flex: 1, minHeight: 0 }}>
         <Sider
           width={320}
           style={{
             background: '#fff',
-            overflow: 'auto',
-            height: 'calc(100vh - 64px)'
+            overflow: 'auto'
           }}
         >
           <ScanButton
@@ -74,7 +73,7 @@ const App: React.FC = () => {
           style={{
             padding: 24,
             background: '#f0f2f5',
-            minHeight: 'calc(100vh - 64px)',
+            minHeight: 0,
             overflow: 'auto'
           }}
         >
@@ -105,6 +104,23 @@ const App: React.FC = () => {
           )}
         </Content>
       </Layout>
+      <Footer
+        style={{
+          flex: '0 0 36px',
+          height: 36,
+          padding: '8px 24px',
+          background: '#fff',
+          borderTop: '1px solid #e8e8e8',
+          color: '#666',
+          fontSize: 12,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center'
+        }}
+      >
+        <span>AUTBUS Device Scanner</span>
+        <span>设备发现与管理工具</span>
+      </Footer>
     </Layout>
   );
 };

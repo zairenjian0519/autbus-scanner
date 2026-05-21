@@ -1,5 +1,5 @@
 import React from 'react';
-import { Card, Descriptions, Tag, Space, Button, Spin, Empty } from 'antd';
+import { Card, Descriptions, Tag, Space, Button, Empty } from 'antd';
 import { WifiOutlined, DisconnectOutlined, SyncOutlined } from '@ant-design/icons';
 import type { AUTBUSDevice } from '../types/device';
 import PropertyTable from './PropertyTable';
@@ -53,12 +53,6 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
     };
     const config = typeMap[type] || { color: 'default', text: type };
     return <Tag color={config.color}>{config.text}</Tag>;
-  };
-
-  const formatValue = (value: any) => {
-    if (value === undefined || value === null) return '-';
-    if (typeof value === 'boolean') return value ? '是' : '否';
-    return String(value);
   };
 
   return (
@@ -143,7 +137,7 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
       {device.type === 'controller' && (
         <>
           {getOPCUAConnection(device.id)?.status === 'connected' && (
-            <Card title="OPC UA 节点">
+            <Card title="AUTBUS 总线">
               <OPCUANodeTree 
                 nodes={getOPCUAConnection(device.id)?.nodes || []} 
                 loading={loading}
@@ -151,7 +145,7 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
             </Card>
           )}
           {getOPCUAConnection(device.id)?.status === 'error' && (
-            <Card title="OPC UA 连接错误" type="exception">
+            <Card title="OPC UA 连接错误">
               <p>{getOPCUAConnection(device.id)?.errorMessage || '连接失败'}</p>
             </Card>
           )}
