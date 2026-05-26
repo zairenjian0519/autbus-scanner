@@ -76,24 +76,29 @@ export class OPCUAService {
   }
 
   // 连接到OPC UA服务器
-  async connect(endpoint: string, deviceId: string): Promise<OPCUAConnection> {
+  async connect(
+    endpoint: string,
+    deviceId: string,
+    options: { skipBrowse?: boolean; timeoutMs?: number } = {}
+  ): Promise<OPCUAConnection> {
     console.log(`连接到OPC UA服务器: ${endpoint}`);
 
     try {
       // 发送连接请求
       const request = await this.sendRequest('opcua-connect', {
         endpoint,
-        deviceId
+        deviceId,
+        skipBrowse: options.skipBrowse
       });
 
       // 10秒连接超时管理
-      let timeoutId: NodeJS.Timeout;
+      let timeoutId: NodeJS.Timeout | undefined;
       const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
           // 超时后取消连接操作
           request.cancel();
           reject(new Error('连接超时'));
-        }, 10000); // 10秒超时
+        }, options.timeoutMs ?? 30000); // 30秒超时
       });
 
       const result = await Promise.race([

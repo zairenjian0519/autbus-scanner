@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const dgram = require('dgram');
+const os = require('os');
 const { OPCUAClient, MessageSecurityMode, SecurityPolicy, resolveNodeId } = require('node-opcua-client');
 const { DataType, Variant } = require('node-opcua-variant');
 
@@ -18,6 +19,109 @@ console.log(`WebSocket server started on port ${CONFIG.WS_PORT}`);
 const opcuaConnections = new Map();
 // 存储OPC UA服务器模型数据（deviceId -> nodes）
 const opcuaModels = new Map();
+const pendingOpcuaRequests = new Map();
+
+function normalizeAddressFamily(family) {
+  if (family === 4 || family === 'IPv4') return 'IPv4';
+  if (family === 6 || family === 'IPv6') return 'IPv6';
+  return String(family);
+}
+
+function splitScopedIpv6Address(address) {
+  const [host, zone] = String(address).split('%');
+  return { host, zone };
+}
+
+function getSystemNetworkInterfaces() {
+  return Object.entries(os.networkInterfaces()).map(([name, addresses = []]) => {
+    const normalizedAddresses = addresses.map((addressInfo) => ({
+      ...addressInfo,
+      family: normalizeAddressFamily(addressInfo.family)
+    }));
+
+    const ipv4Addresses = normalizedAddresses
+      .filter((addressInfo) => addressInfo.family === 'IPv4')
+      .map((addressInfo) => addressInfo.address);
+
+    const ipv6AddressInfos = normalizedAddresses
+      .filter((addressInfo) => addressInfo.family === 'IPv6');
+
+    const firstExternalAddress = normalizedAddresses.find((addressInfo) => !addressInfo.internal);
+    const firstAddress = firstExternalAddress || normalizedAddresses[0];
+    const firstMacAddress = normalizedAddresses.find((addressInfo) => addressInfo.mac && addressInfo.mac !== '00:00:00:00:00:00');
+    const scopedIpv6Address = ipv6AddressInfos.find((addressInfo) => {
+      const scoped = splitScopedIpv6Address(addressInfo.address);
+      return !addressInfo.internal && scoped.host.toLowerCase().startsWith('fe80:') && (addressInfo.scopeid || scoped.zone);
+    }) || ipv6AddressInfos.find((addressInfo) => {
+      const scoped = splitScopedIpv6Address(addressInfo.address);
+      return !addressInfo.internal && (addressInfo.scopeid || scoped.zone);
+    }) || ipv6AddressInfos.find((addressInfo) => !addressInfo.internal) || ipv6AddressInfos[0];
+    const scopedAddressParts = scopedIpv6Address ? splitScopedIpv6Address(scopedIpv6Address.address) : null;
+    const scopeId = scopedIpv6Address?.scopeid ?? scopedAddressParts?.zone;
+    const rawIpv6Addresses = ipv6AddressInfos.map((addressInfo) => splitScopedIpv6Address(addressInfo.address).host);
+    const ipv6Addresses = scopedAddressParts
+      ? [scopedAddressParts.host, ...rawIpv6Addresses.filter((address) => address !== scopedAddressParts.host)]
+      : rawIpv6Addresses;
+
+    return {
+      id: name,
+      name,
+      ipv4Addresses,
+      ipv6Addresses,
+      macAddress: firstMacAddress?.mac || firstAddress?.mac || '00:00:00:00:00:00',
+      isUp: normalizedAddresses.length > 0,
+      isLoopback: normalizedAddresses.length > 0 && normalizedAddresses.every((addressInfo) => addressInfo.internal),
+      scopeId,
+      multicastInterface: scopedAddressParts && scopeId ? `${scopedAddressParts.host}%${scopeId}` : undefined
+    };
+  });
+}
+
+function getInterfaceById(interfaceId) {
+  return getSystemNetworkInterfaces().find((networkInterface) => networkInterface.id === interfaceId);
+}
+
+function getMulticastTargetAddress(multicastAddress, networkInterface) {
+  if (!networkInterface?.scopeId || String(multicastAddress).includes('%')) {
+    return multicastAddress;
+  }
+
+  return `${multicastAddress}%${networkInterface.scopeId}`;
+}
+
+function macToBuffer(macAddress) {
+  const buffer = Buffer.alloc(6);
+  if (!macAddress) return buffer;
+
+  String(macAddress)
+    .split(/[:-]/)
+    .slice(0, 6)
+    .forEach((part, index) => {
+      const value = parseInt(part, 16);
+      buffer[index] = Number.isFinite(value) ? value : 0;
+    });
+
+  return buffer;
+}
+
+function ipv6ToBuffer(ipv6Address) {
+  const buffer = Buffer.alloc(16);
+  if (!ipv6Address) return buffer;
+
+  const address = String(ipv6Address).split('%')[0];
+  const [leftPart, rightPart = ''] = address.split('::');
+  const left = leftPart ? leftPart.split(':') : [];
+  const right = rightPart ? rightPart.split(':') : [];
+  const zeroCount = Math.max(0, 8 - left.length - right.length);
+  const parts = [...left, ...Array(zeroCount).fill('0'), ...right].slice(0, 8);
+
+  parts.forEach((part, index) => {
+    const value = parseInt(part || '0', 16);
+    buffer.writeUInt16BE(Number.isFinite(value) ? value : 0, index * 2);
+  });
+
+  return buffer;
+}
 
 // 创建UDP套接字
 const udpSocket = dgram.createSocket('udp6');
@@ -33,8 +137,20 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message);
       
       switch (data.type) {
+        case 'get-network-interfaces':
+          ws.send(JSON.stringify({
+            type: 'network-interfaces',
+            interfaces: getSystemNetworkInterfaces()
+          }));
+          break;
+
         case 'scan':
           console.log('Received scan request:', data);
+          const selectedInterface = getInterfaceById(data.interfaceId);
+          const multicastAddress = data.multicastAddress || CONFIG.MULTICAST_ADDRESS;
+          const scanPort = data.port || CONFIG.UDP_PORT;
+          const multicastTargetAddress = getMulticastTargetAddress(multicastAddress, selectedInterface);
+          console.log('Selected network interface:', selectedInterface || data.interfaceId);
           
           // 发送IPv6组播扫描请求
           const devices = [];
@@ -55,26 +171,28 @@ wss.on('connection', (ws) => {
           // 序列号
           buffer.writeUInt32LE(sequenceNumber, 6);
           // 前端MAC地址 (模拟)
-          buffer.writeUInt8(0x00, 10);
-          buffer.writeUInt8(0x11, 11);
-          buffer.writeUInt8(0x22, 12);
-          buffer.writeUInt8(0x33, 13);
-          buffer.writeUInt8(0x44, 14);
-          buffer.writeUInt8(0x55, 15);
+          macToBuffer(selectedInterface?.macAddress).copy(buffer, 10);
           // 前端IPv6地址 (模拟)
-          for (let i = 0; i < 16; i++) {
-            buffer.writeUInt8(0x00, 16 + i);
-          }
+          ipv6ToBuffer(selectedInterface?.ipv6Addresses?.[0]).copy(buffer, 16);
           
           // 发送组播请求
-          console.log('准备发送IPv6组播报文到:', CONFIG.MULTICAST_ADDRESS, '端口:', CONFIG.UDP_PORT);
+          console.log('准备发送IPv6组播报文到:', multicastTargetAddress, '端口:', scanPort);
           console.log('报文内容:', buffer.toString('hex'));
           
-          udpSocket.send(buffer, CONFIG.UDP_PORT, CONFIG.MULTICAST_ADDRESS, (err) => {
+          if (selectedInterface?.multicastInterface) {
+            try {
+              udpSocket.setMulticastInterface(selectedInterface.multicastInterface);
+              console.log('Using multicast interface:', selectedInterface.multicastInterface);
+            } catch (error) {
+              console.error('Failed to set multicast interface:', error);
+            }
+          }
+
+          udpSocket.send(buffer, scanPort, multicastTargetAddress, (err) => {
             if (err) {
               console.error('Error sending multicast request:', err);
             } else {
-              console.log('Multicast scan request sent successfully to', CONFIG.MULTICAST_ADDRESS, ':', CONFIG.UDP_PORT);
+              console.log('Multicast scan request sent successfully to', multicastTargetAddress, ':', scanPort);
               console.log('报文长度:', buffer.length, '字节');
             }
           });
@@ -159,7 +277,7 @@ wss.on('connection', (ws) => {
         case 'opcua-connect':
           // OPC UA连接逻辑
           console.log('收到OPC UA连接请求:', data);
-          const { endpoint, deviceId } = data;
+          const { endpoint, deviceId, skipBrowse } = data;
           
           try {
             // 创建OPC UA客户端
@@ -172,6 +290,7 @@ wss.on('connection', (ws) => {
               securityMode: MessageSecurityMode.None,
               securityPolicy: SecurityPolicy.None
             });
+            pendingOpcuaRequests.set(data.requestId, { client, session: null, deviceId });
             
             // 连接到服务器
             await client.connect(endpoint);
@@ -179,13 +298,30 @@ wss.on('connection', (ws) => {
             
             // 创建会话
             const session = await client.createSession();
+            pendingOpcuaRequests.set(data.requestId, { client, session, deviceId });
             console.log('OPC UA会话创建成功');
             
             // 保存连接信息
             opcuaConnections.set(deviceId, { client, session });
+
+            if (skipBrowse) {
+              pendingOpcuaRequests.delete(data.requestId);
+              ws.send(JSON.stringify({
+                type: 'opcua-connect-complete',
+                requestId: data.requestId,
+                deviceId,
+                status: 'connected',
+                nodes: []
+              }));
+              break;
+            }
             
             // 浏览节点
             const nodes = await browseNodes(session);
+            if (!pendingOpcuaRequests.has(data.requestId) && !opcuaConnections.has(deviceId)) {
+              break;
+            }
+            pendingOpcuaRequests.delete(data.requestId);
             
             // 保存模型数据
             opcuaModels.set(deviceId, nodes);
@@ -202,6 +338,7 @@ wss.on('connection', (ws) => {
               nodes
             }));
           } catch (error) {
+            pendingOpcuaRequests.delete(data.requestId);
             console.error('OPC UA连接失败:', error);
             ws.send(JSON.stringify({
               type: 'opcua-connect-complete',
@@ -451,8 +588,23 @@ wss.on('connection', (ws) => {
         case 'opcua-cancel':
           // 取消OPC UA操作
           console.log('收到取消OPC UA操作请求:', data);
-          // 这里可以添加取消正在进行的OPC UA操作的逻辑
-          // 例如，取消正在进行的连接操作
+          const pendingRequest = pendingOpcuaRequests.get(data.requestId);
+          if (pendingRequest) {
+            pendingOpcuaRequests.delete(data.requestId);
+            try {
+              if (pendingRequest.session) {
+                await pendingRequest.session.close();
+              }
+              if (pendingRequest.client) {
+                await pendingRequest.client.disconnect();
+              }
+              opcuaConnections.delete(pendingRequest.deviceId);
+              opcuaModels.delete(pendingRequest.deviceId);
+              console.log('Canceled pending OPC UA request:', data.requestId);
+            } catch (error) {
+              console.error('Failed to cancel pending OPC UA request:', error);
+            }
+          }
           break;
           
         default:

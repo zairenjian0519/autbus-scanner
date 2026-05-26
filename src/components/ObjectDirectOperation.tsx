@@ -73,7 +73,10 @@ const ObjectDirectOperation: React.FC = () => {
       console.log('连接到 OPC UA 服务器:', endpointUrl);
 
       // 连接到 OPC UA 服务器
-      const connection = await opcuaService.connect(endpointUrl, newDeviceId);
+      await opcuaService.connect(endpointUrl, newDeviceId, {
+        skipBrowse: true,
+        timeoutMs: 30000
+      });
       
       console.log('连接成功，浏览节点树...');
 

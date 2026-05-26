@@ -8,6 +8,15 @@ class NetworkService {
   private isBrowser: boolean = typeof window !== 'undefined';
   private Buffer: any = this.isBrowser ? (window as any).Buffer : Buffer;
 
+  private connectTemporaryWebSocket(): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket('ws://localhost:8082');
+
+      ws.onopen = () => resolve(ws);
+      ws.onerror = (error) => reject(error);
+    });
+  }
+
   // 连接WebSocket后端服务
   private connectWebSocket(): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
@@ -49,6 +58,37 @@ class NetworkService {
 
   // 获取网络接口列表
   async getNetworkInterfaces(): Promise<NetworkInterface[]> {
+    try {
+      const ws = await this.connectTemporaryWebSocket();
+
+      return await new Promise<NetworkInterface[]>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close();
+          reject(new Error('Timed out while loading network interfaces'));
+        }, 3000);
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'network-interfaces') {
+              clearTimeout(timeout);
+              ws.close();
+              resolve(data.interfaces || []);
+            }
+          } catch (error) {
+            clearTimeout(timeout);
+            ws.close();
+            reject(error);
+          }
+        };
+
+        ws.send(JSON.stringify({ type: 'get-network-interfaces' }));
+      });
+    } catch (error) {
+      console.error('Failed to load real network interfaces, using mock data:', error);
+    }
+
     // 实际环境中，这里应该使用os.networkInterfaces()获取真实的网络接口
     // 为了前端演示，返回模拟数据
     console.log('getNetworkInterfaces called');

@@ -9,10 +9,13 @@ export type AccessType = 'read' | 'write' | 'readWrite';
 export interface NetworkInterface {
   id: string;
   name: string;
+  ipv4Addresses?: string[];
   ipv6Addresses: string[];
   macAddress: string;
   isUp: boolean;
   isLoopback: boolean;
+  scopeId?: number | string;
+  multicastInterface?: string;
 }
 
 export interface OPCUAConnection {

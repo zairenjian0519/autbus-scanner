@@ -220,7 +220,7 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
       const interfaces = await networkService.getNetworkInterfaces();
       console.log('Loaded interfaces:', interfaces);
       set({ networkInterfaces: interfaces });
-      if (interfaces.length > 0 && !get().selectedInterface) {
+      if (interfaces.length > 0 && !interfaces.some(intf => intf.id === get().selectedInterface?.id)) {
         const firstNonLoopback = interfaces.find(intf => !intf.isLoopback && intf.isUp);
         console.log('First non-loopback interface:', firstNonLoopback);
         if (firstNonLoopback) {
