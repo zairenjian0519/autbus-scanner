@@ -66,8 +66,8 @@ const ObjectDirectOperation: React.FC = () => {
       // 构建 OPC UA 端点 URL
       const endpointUrl = `opc.tcp://[${formattedIPv6}]:4840`;
       
-      // 生成设备ID（使用时间戳）
-      const newDeviceId = `device_${Date.now()}`;
+      // 使用稳定ID，让同一个IPv6地址复用后端已有的OPC UA连接
+      const newDeviceId = `direct_${formattedIPv6.replace(/:/g, '')}`;
       setDeviceId(newDeviceId);
 
       console.log('连接到 OPC UA 服务器:', endpointUrl);
@@ -295,7 +295,7 @@ const ObjectDirectOperation: React.FC = () => {
         </div>
       )}
 
-      <style jsx>{`
+      <style>{`
         .object-direct-operation {
           padding: 20px;
           background-color: #f5f5f5;

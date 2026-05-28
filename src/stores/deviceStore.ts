@@ -31,7 +31,7 @@ interface DeviceState {
   clearDevices: () => void;
   getDeviceById: (id: string) => AUTBUSDevice | undefined;
   setNetworkInterfaces: (interfaces: NetworkInterface[]) => void;
-  setSelectedInterface: (interface: NetworkInterface | null) => void;
+  setSelectedInterface: (networkInterface: NetworkInterface | null) => void;
   loadNetworkInterfaces: () => Promise<void>;
   setOPCUAConnection: (connection: OPCUAConnection) => void;
   updateOPCUAConnection: (deviceId: string, updates: Partial<OPCUAConnection>) => void;
@@ -278,7 +278,7 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
 }));
 
 export const useDiscoveryService = () => {
-  const { setDevices, setIsScanning, setSelectedDevice, selectedInterface, discoveryConfig, loadNetworkInterfaces } = useDeviceStore.getState();
+  const { setDevices, setIsScanning, selectedInterface, discoveryConfig, loadNetworkInterfaces } = useDeviceStore.getState();
 
   const startDiscovery = async () => {
     if (!selectedInterface) {
@@ -338,20 +338,14 @@ export const useDiscoveryService = () => {
           nodes: connection.nodes
         });
 
-        // 连接成功后执行browse操作获取所有数据建模
-        const browsedNodes = await opcuaService.browseNodes(deviceId);
-        if (browsedNodes.length > 0) {
-          // 更新节点数据
-          useDeviceStore.getState().updateOPCUAConnection(deviceId, { nodes: browsedNodes });
-          console.log(`设备 ${deviceId} 浏览节点完成，发现 ${browsedNodes.length} 个根节点`);
-        }
-
         // 设置定时查询变量节点数据的定时器（5秒周期）
         const pollInterval = 5000; // 5秒
         const timer = setInterval(async () => {
           try {
             const opcuaConn = useDeviceStore.getState().getOPCUAConnection(deviceId);
             if (opcuaConn && opcuaConn.status === 'connected') {
+              const nodesToUpdate = opcuaConn.nodes || [];
+
               // 遍历所有节点，找出变量节点并更新其值
               const updateVariableNode = async (node: any) => {
                 if (node.nodeClass === 'Variable') {
@@ -376,12 +370,14 @@ export const useDiscoveryService = () => {
               };
 
               // 遍历所有根节点
-              for (const rootNode of opcuaConn.nodes) {
+              for (const rootNode of nodesToUpdate) {
                 await updateVariableNode(rootNode);
               }
 
               // 更新连接信息中的节点数据
-              useDeviceStore.getState().updateOPCUAConnection(deviceId, { nodes: opcuaConn.nodes });
+              if (useDeviceStore.getState().getOPCUAConnection(deviceId)?.nodes === nodesToUpdate) {
+                useDeviceStore.getState().updateOPCUAConnection(deviceId, { nodes: [...nodesToUpdate] });
+              }
             }
           } catch (error) {
             console.error(`定时查询设备 ${deviceId} 变量节点失败:`, error);
@@ -404,6 +400,24 @@ export const useDiscoveryService = () => {
     }
   };
 
+  const refreshDeviceNodes = async (deviceId: string) => {
+    const connection = useDeviceStore.getState().getOPCUAConnection(deviceId);
+
+    if (!connection || connection.status !== 'connected') {
+      throw new Error('OPC UA未连接，无法刷新点表');
+    }
+
+    const nodes = await opcuaService.browseNodes(deviceId);
+    useDeviceStore.getState().updateOPCUAConnection(deviceId, {
+      status: 'connected',
+      nodes,
+      errorMessage: undefined
+    });
+
+    console.log(`设备 ${deviceId} 点表刷新完成，发现 ${nodes.length} 个根节点`);
+    return nodes;
+  };
+
   const disconnectDevice = async (deviceId: string) => {
     try {
       // 清除定时器
@@ -422,6 +436,7 @@ export const useDiscoveryService = () => {
   return {
     startDiscovery,
     connectToDevice,
+    refreshDeviceNodes,
     disconnectDevice,
     config: discoveryConfig
   };

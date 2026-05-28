@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Tree, Card, Descriptions, Input, InputNumber, Switch, Button, Spin } from 'antd';
 import type { DataNode } from 'antd/es/tree';
-import { FolderOutlined, FileOutlined, AppstoreOutlined, KeyOutlined } from '@ant-design/icons';
+import { FolderOutlined, FileOutlined, AppstoreOutlined, KeyOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { OPCUANode } from '../types/device';
 import { opcuaService } from '../services/opcuaService';
 import { useDeviceStore } from '../stores/deviceStore';
@@ -10,6 +10,8 @@ interface OPCUANodeTreeProps {
   nodes: OPCUANode[];
   loading?: boolean;
   onNodeSelect?: (node: OPCUANode) => void;
+  onRefresh?: () => void;
+  refreshing?: boolean;
 }
 
 type OPCUATreeDataNode = DataNode & {
@@ -109,7 +111,9 @@ const footerButtonStyle: React.CSSProperties = {
 const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   nodes,
   loading = false,
-  onNodeSelect
+  onNodeSelect,
+  onRefresh,
+  refreshing = false
 }) => {
   const [selectedNode, setSelectedNode] = useState<OPCUANode | null>(null);
   const [selectedNodeKey, setSelectedNodeKey] = useState<string | null>(null);
@@ -420,7 +424,23 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   };
 
   return (
-    <Card title="AUTBUS 总线设备树" style={nodeTreeCardStyle} bodyStyle={nodeTreeCardBodyStyle}>
+    <Card
+      title="AUTBUS 总线设备树"
+      extra={
+        onRefresh ? (
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            onClick={onRefresh}
+            loading={refreshing}
+          >
+            刷新点表
+          </Button>
+        ) : null
+      }
+      style={nodeTreeCardStyle}
+      bodyStyle={nodeTreeCardBodyStyle}
+    >
       <div style={nodeTreeContentStyle}>
         <div style={treePaneStyle}>
           <Spin spinning={loading}>

@@ -1,5 +1,5 @@
-import React from 'react';
-import { Card, Descriptions, Tag, Space, Button, Empty } from 'antd';
+import React, { useState } from 'react';
+import { Card, Descriptions, Tag, Space, Button, Empty, message } from 'antd';
 import { WifiOutlined, DisconnectOutlined, SyncOutlined } from '@ant-design/icons';
 import type { AUTBUSDevice } from '../types/device';
 import PropertyTable from './PropertyTable';
@@ -13,7 +13,9 @@ interface DeviceDetailsProps {
 
 const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
   const { getOPCUAConnection } = useDeviceStore();
-  const { connectToDevice, disconnectDevice } = useDiscoveryService();
+  const { connectToDevice, disconnectDevice, refreshDeviceNodes } = useDiscoveryService();
+  const [refreshingNodes, setRefreshingNodes] = useState(false);
+  const opcuaConnection = device ? getOPCUAConnection(device.id) : undefined;
 
   if (!device) {
     return (
@@ -32,6 +34,22 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
   const handleDisconnect = async () => {
     if (device.status === 'online') {
       await disconnectDevice(device.id);
+    }
+  };
+
+  const handleRefreshNodes = async () => {
+    if (refreshingNodes) {
+      return;
+    }
+
+    setRefreshingNodes(true);
+    try {
+      const nodes = await refreshDeviceNodes(device.id);
+      message.success(`点表刷新完成，共 ${nodes.length} 个根节点`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '刷新点表失败');
+    } finally {
+      setRefreshingNodes(false);
     }
   };
 
@@ -136,17 +154,19 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
 
       {device.type === 'controller' && (
         <>
-          {getOPCUAConnection(device.id)?.status === 'connected' && (
+          {opcuaConnection?.status === 'connected' && (
             <Card title="AUTBUS 总线">
               <OPCUANodeTree 
-                nodes={getOPCUAConnection(device.id)?.nodes || []} 
-                loading={loading}
+                nodes={opcuaConnection.nodes || []} 
+                loading={loading || refreshingNodes}
+                onRefresh={handleRefreshNodes}
+                refreshing={refreshingNodes}
               />
             </Card>
           )}
-          {getOPCUAConnection(device.id)?.status === 'error' && (
+          {opcuaConnection?.status === 'error' && (
             <Card title="OPC UA 连接错误">
-              <p>{getOPCUAConnection(device.id)?.errorMessage || '连接失败'}</p>
+              <p>{opcuaConnection.errorMessage || '连接失败'}</p>
             </Card>
           )}
         </>

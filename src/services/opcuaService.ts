@@ -46,11 +46,8 @@ export class OPCUAService {
   private async sendRequest(type: string, data: any): Promise<{ result: any; cancel: () => void }> {
     const ws = await this.connectWebSocket();
     const requestId = `req_${++this.requestId}_${Date.now()}`;
-    
-    let resolveFn: (data: any) => void;
-    
+
     const promise = new Promise<any>((resolve) => {
-      resolveFn = resolve;
       this.callbacks.set(requestId, resolve);
       ws.send(JSON.stringify({
         type,
@@ -149,9 +146,34 @@ export class OPCUAService {
   async browseNodes(deviceId: string): Promise<OPCUANode[]> {
     console.log(`浏览OPC UA节点: ${deviceId}`);
 
-    // 节点浏览在连接时已经完成，直接返回缓存的节点
-    // 这里可以根据需要实现动态浏览
-    return [];
+    const request = await this.sendRequest('opcua-browse', {
+      deviceId
+    });
+
+    let timeoutId: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        request.cancel();
+        reject(new Error('浏览节点超时'));
+      }, 30000);
+    });
+
+    try {
+      const result = await Promise.race([
+        request.result,
+        timeoutPromise
+      ]);
+
+      if (result.status === 'success') {
+        return result.nodes || [];
+      }
+
+      throw new Error(result.errorMessage || '浏览节点失败');
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
   }
 
   // 读取节点值
@@ -206,7 +228,7 @@ export class OPCUAService {
   }
 
   // 订阅节点
-  async subscribeNode(nodeId: string, callback: (value: any) => void, deviceId?: string): Promise<string> {
+  async subscribeNode(nodeId: string, _callback: (value: any) => void, _deviceId?: string): Promise<string> {
     console.log(`订阅节点: ${nodeId}`);
 
     // 这里可以实现订阅功能

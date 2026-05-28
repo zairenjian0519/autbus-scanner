@@ -8,7 +8,8 @@ const CONFIG = {
   WS_PORT: 8082,
   UDP_PORT: 6060,
   MULTICAST_ADDRESS: 'ff03::c',
-  TIMEOUT: 1000
+  TIMEOUT: 1000,
+  DIRECT_OPCUA_IDLE_TIMEOUT: 5 * 60 * 1000
 };
 
 // 创建WebSocket服务器
@@ -20,6 +21,80 @@ const opcuaConnections = new Map();
 // 存储OPC UA服务器模型数据（deviceId -> nodes）
 const opcuaModels = new Map();
 const pendingOpcuaRequests = new Map();
+
+function isDirectOperationDevice(deviceId) {
+  return typeof deviceId === 'string' && deviceId.startsWith('direct_');
+}
+
+async function closeOpcuaConnection(deviceId, reason = 'manual') {
+  const connection = opcuaConnections.get(deviceId);
+  if (!connection) {
+    return;
+  }
+
+  if (connection.idleTimer) {
+    clearTimeout(connection.idleTimer);
+  }
+
+  opcuaConnections.delete(deviceId);
+  opcuaModels.delete(deviceId);
+
+  try {
+    if (connection.session) {
+      await connection.session.close();
+    }
+  } catch (error) {
+    console.error(`Failed to close OPC UA session for ${deviceId}:`, error);
+  }
+
+  try {
+    if (connection.client) {
+      await connection.client.disconnect();
+    }
+  } catch (error) {
+    console.error(`Failed to disconnect OPC UA client for ${deviceId}:`, error);
+  }
+
+  console.log(`OPC UA connection closed for ${deviceId}, reason: ${reason}`);
+}
+
+function scheduleDirectOpcuaIdleCleanup(deviceId) {
+  const connection = opcuaConnections.get(deviceId);
+  if (!connection || !isDirectOperationDevice(deviceId)) {
+    return;
+  }
+
+  if (connection.idleTimer) {
+    clearTimeout(connection.idleTimer);
+  }
+
+  connection.idleTimer = setTimeout(() => {
+    closeOpcuaConnection(deviceId, 'idle-timeout');
+  }, CONFIG.DIRECT_OPCUA_IDLE_TIMEOUT);
+}
+
+function touchOpcuaConnection(deviceId) {
+  const connection = opcuaConnections.get(deviceId);
+  if (!connection) {
+    return;
+  }
+
+  connection.lastUsed = Date.now();
+  scheduleDirectOpcuaIdleCleanup(deviceId);
+}
+
+async function isOpcuaConnectionAlive(connection) {
+  try {
+    await connection.session.read([{
+      nodeId: 'ns=0;i=2258',
+      attributeId: 13
+    }]);
+    return true;
+  } catch (error) {
+    console.warn('OPC UA connection health check failed:', error.message);
+    return false;
+  }
+}
 
 function normalizeAddressFamily(family) {
   if (family === 4 || family === 'IPv4') return 'IPv4';
@@ -280,6 +355,24 @@ wss.on('connection', (ws) => {
           const { endpoint, deviceId, skipBrowse } = data;
           
           try {
+            const existingConnection = opcuaConnections.get(deviceId);
+            if (existingConnection && existingConnection.endpoint === endpoint) {
+              const isAlive = await isOpcuaConnectionAlive(existingConnection);
+              if (isAlive) {
+                touchOpcuaConnection(deviceId);
+                ws.send(JSON.stringify({
+                  type: 'opcua-connect-complete',
+                  requestId: data.requestId,
+                  deviceId,
+                  status: 'connected',
+                  nodes: skipBrowse ? [] : (opcuaModels.get(deviceId) || [])
+                }));
+                break;
+              }
+
+              await closeOpcuaConnection(deviceId, 'stale-before-reconnect');
+            }
+
             // 创建OPC UA客户端
             const client = OPCUAClient.create({
               applicationName: 'AUTBUS Scanner',
@@ -302,7 +395,14 @@ wss.on('connection', (ws) => {
             console.log('OPC UA会话创建成功');
             
             // 保存连接信息
-            opcuaConnections.set(deviceId, { client, session });
+            opcuaConnections.set(deviceId, {
+              client,
+              session,
+              endpoint,
+              lastUsed: Date.now(),
+              idleTimer: null
+            });
+            scheduleDirectOpcuaIdleCleanup(deviceId);
 
             if (skipBrowse) {
               pendingOpcuaRequests.delete(data.requestId);
@@ -358,11 +458,7 @@ wss.on('connection', (ws) => {
           try {
             const connection = opcuaConnections.get(disconnectDeviceId);
             if (connection) {
-              await connection.session.close();
-              await connection.client.disconnect();
-              opcuaConnections.delete(disconnectDeviceId);
-              // 清理模型数据
-              opcuaModels.delete(disconnectDeviceId);
+              await closeOpcuaConnection(disconnectDeviceId, 'manual-disconnect');
               console.log('OPC UA连接已断开，模型数据已清理');
             }
             ws.send(JSON.stringify({
@@ -382,6 +478,41 @@ wss.on('connection', (ws) => {
             }));
           }
           break;
+
+        case 'opcua-browse':
+          // OPC UA重新浏览节点点表
+          console.log('收到OPC UA浏览节点请求:', data);
+          const { deviceId: browseDeviceId } = data;
+
+          try {
+            const connection = opcuaConnections.get(browseDeviceId);
+            if (!connection) {
+              throw new Error('未找到OPC UA连接');
+            }
+            touchOpcuaConnection(browseDeviceId);
+
+            const nodes = await browseNodes(connection.session);
+            opcuaModels.set(browseDeviceId, nodes);
+            console.log(`设备 ${browseDeviceId} 点表刷新完成，包含 ${nodes.length} 个根节点`);
+
+            ws.send(JSON.stringify({
+              type: 'opcua-browse-complete',
+              requestId: data.requestId,
+              deviceId: browseDeviceId,
+              status: 'success',
+              nodes
+            }));
+          } catch (error) {
+            console.error('OPC UA浏览节点失败:', error);
+            ws.send(JSON.stringify({
+              type: 'opcua-browse-complete',
+              requestId: data.requestId,
+              deviceId: browseDeviceId,
+              status: 'error',
+              errorMessage: error.message
+            }));
+          }
+          break;
           
         case 'opcua-read':
           // OPC UA读取节点值逻辑
@@ -393,6 +524,7 @@ wss.on('connection', (ws) => {
             if (!connection) {
               throw new Error('未找到OPC UA连接');
             }
+            touchOpcuaConnection(readDeviceId);
             
             // 解析 NodeId
             const resolvedNodeId = resolveNodeId(nodeId);
@@ -455,6 +587,7 @@ wss.on('connection', (ws) => {
             if (!connection) {
               throw new Error('未找到OPC UA连接');
             }
+            touchOpcuaConnection(writeDeviceId);
             
             // 解析 NodeId
             resolvedNodeId = resolveNodeId(writeNodeId);
@@ -592,14 +725,18 @@ wss.on('connection', (ws) => {
           if (pendingRequest) {
             pendingOpcuaRequests.delete(data.requestId);
             try {
-              if (pendingRequest.session) {
-                await pendingRequest.session.close();
+              const savedConnection = opcuaConnections.get(pendingRequest.deviceId);
+              if (savedConnection) {
+                await closeOpcuaConnection(pendingRequest.deviceId, 'cancel');
+              } else {
+                if (pendingRequest.session) {
+                  await pendingRequest.session.close();
+                }
+                if (pendingRequest.client) {
+                  await pendingRequest.client.disconnect();
+                }
+                opcuaModels.delete(pendingRequest.deviceId);
               }
-              if (pendingRequest.client) {
-                await pendingRequest.client.disconnect();
-              }
-              opcuaConnections.delete(pendingRequest.deviceId);
-              opcuaModels.delete(pendingRequest.deviceId);
               console.log('Canceled pending OPC UA request:', data.requestId);
             } catch (error) {
               console.error('Failed to cancel pending OPC UA request:', error);
