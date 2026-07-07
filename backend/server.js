@@ -1,16 +1,159 @@
 const WebSocket = require('ws');
 const dgram = require('dgram');
 const os = require('os');
-const { OPCUAClient, MessageSecurityMode, SecurityPolicy, resolveNodeId } = require('node-opcua-client');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { OPCUAClient, MessageSecurityMode, SecurityPolicy, resolveNodeId, AttributeIds } = require('node-opcua-client');
 const { DataType, Variant } = require('node-opcua-variant');
 
 const CONFIG = {
+  HTTP_PORT: 3001,
   WS_PORT: 8082,
   UDP_PORT: 6060,
   MULTICAST_ADDRESS: 'ff03::c',
   TIMEOUT: 1000,
   DIRECT_OPCUA_IDLE_TIMEOUT: 5 * 60 * 1000
 };
+
+const STATIC_DIR = path.resolve(__dirname, '..', 'dist');
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+};
+
+const httpServer = http.createServer((req, res) => {
+  const requestedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const requestedPath = decodeURIComponent(requestedUrl.pathname);
+  const normalizedPath = requestedPath === '/' ? '/index.html' : requestedPath;
+  const filePath = path.resolve(STATIC_DIR, `.${normalizedPath}`);
+
+  if (!filePath.startsWith(STATIC_DIR)) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+
+  const servePath = fs.existsSync(filePath) && fs.statSync(filePath).isFile()
+    ? filePath
+    : path.join(STATIC_DIR, 'index.html');
+
+  fs.readFile(servePath, (error, content) => {
+    if (error) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Frontend files were not found. Please build the app before starting the packaged server.');
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': MIME_TYPES[path.extname(servePath).toLowerCase()] || 'application/octet-stream'
+    });
+    res.end(content);
+  });
+});
+
+httpServer.listen(CONFIG.HTTP_PORT, () => {
+  console.log(`HTTP server started on http://localhost:${CONFIG.HTTP_PORT}`);
+});
+
+const nodeNameCollator = new Intl.Collator('zh-CN', {
+  numeric: true,
+  sensitivity: 'base'
+});
+
+function getSortableNodeName(node) {
+  return node?.browseName || node?.displayName || node?.nodeId || '';
+}
+
+function sortOpcuaNodes(nodes) {
+  return [...nodes]
+    .sort((left, right) => nodeNameCollator.compare(
+      getSortableNodeName(left),
+      getSortableNodeName(right)
+    ))
+    .map((node) => ({
+      ...node,
+      children: Array.isArray(node.children) ? sortOpcuaNodes(node.children) : node.children
+    }));
+}
+
+function formatAccessLevelBits(accessLevelValue) {
+  const numericAccessLevel = Number(accessLevelValue);
+  if (!Number.isFinite(numericAccessLevel)) {
+    return undefined;
+  }
+
+  if (numericAccessLevel === 0) {
+    return 'None';
+  }
+
+  const canRead = (numericAccessLevel & 1) === 1;
+  const canWrite = (numericAccessLevel & 2) === 2;
+
+  if (canRead && canWrite) return 'ReadWrite';
+  if (canRead) return 'Read';
+  if (canWrite) return 'Write';
+  return undefined;
+}
+
+function formatAccessLevel(accessLevelValue) {
+  if (accessLevelValue === undefined || accessLevelValue === null) {
+    return undefined;
+  }
+
+  if (typeof accessLevelValue === 'number' || typeof accessLevelValue === 'bigint') {
+    return formatAccessLevelBits(accessLevelValue);
+  }
+
+  if (typeof accessLevelValue === 'string') {
+    const trimmedAccessLevel = accessLevelValue.trim();
+    if (!trimmedAccessLevel) {
+      return undefined;
+    }
+
+    const numericAccessLevel = Number(trimmedAccessLevel);
+    if (!Number.isNaN(numericAccessLevel)) {
+      return formatAccessLevelBits(numericAccessLevel);
+    }
+
+    const compactAccessLevel = trimmedAccessLevel.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const canRead = compactAccessLevel.includes('read') || compactAccessLevel.includes('currentread') || compactAccessLevel.includes('readcurrent');
+    const canWrite = compactAccessLevel.includes('write') || compactAccessLevel.includes('currentwrite') || compactAccessLevel.includes('writecurrent');
+
+    if (canRead && canWrite) return 'ReadWrite';
+    if (canRead) return 'Read';
+    if (canWrite) return 'Write';
+    if (compactAccessLevel === 'none') return 'None';
+    return undefined;
+  }
+
+  if (Array.isArray(accessLevelValue)) {
+    return formatAccessLevel(accessLevelValue.join('|'));
+  }
+
+  if (typeof accessLevelValue === 'object') {
+    if (accessLevelValue.value !== undefined) {
+      return formatAccessLevel(accessLevelValue.value);
+    }
+
+    const enabledKeys = Object.entries(accessLevelValue)
+      .filter(([, value]) => Boolean(value))
+      .map(([key, value]) => `${key}:${value}`);
+
+    return formatAccessLevel(enabledKeys.length > 0 ? enabledKeys.join('|') : accessLevelValue.toString?.());
+  }
+
+  return undefined;
+}
 
 // 创建WebSocket服务器
 const wss = new WebSocket.Server({ port: CONFIG.WS_PORT });
@@ -87,7 +230,7 @@ async function isOpcuaConnectionAlive(connection) {
   try {
     await connection.session.read([{
       nodeId: 'ns=0;i=2258',
-      attributeId: 13
+      attributeId: AttributeIds.Value
     }]);
     return true;
   } catch (error) {
@@ -533,33 +676,39 @@ wss.on('connection', (ws) => {
             // 先从模型中获取显示名称
             let displayName = getDisplayNameFromModel(readDeviceId, nodeId);
             
-            // 读取节点值（如果没有从模型中获取到显示名称，再读取DisplayName属性）
+            // 读取当前节点信息。Value/DataType/AccessLevel 对非变量节点可能为空，但 DisplayName 仍可刷新。
             const attributesToRead = [
-              { nodeId: resolvedNodeId, attributeId: 13 } // Value attribute
+              { nodeId: resolvedNodeId, attributeId: AttributeIds.Value },
+              { nodeId: resolvedNodeId, attributeId: AttributeIds.DisplayName },
+              { nodeId: resolvedNodeId, attributeId: AttributeIds.DataType },
+              { nodeId: resolvedNodeId, attributeId: AttributeIds.AccessLevel }
             ];
-            
-            if (!displayName) {
-              attributesToRead.push({ nodeId: resolvedNodeId, attributeId: 3 }); // DisplayName attribute
-            }
-            
+
             const result = await connection.session.read(attributesToRead);
-            
-            const value = result[0].value.value;
-            
-            // 如果没有从模型中获取到显示名称，则使用服务器返回的
-            if (!displayName && result.length > 1 && result[1].value && result[1].value.value) {
+
+            const value = result[0]?.value?.value;
+            const dataType = result[0]?.value?.dataType
+              ? result[0].value.dataType.toString()
+              : (result[2]?.value?.value ? result[2].value.value.toString() : undefined);
+            const accessLevel = formatAccessLevel(result[3]?.value?.value);
+
+            // 如果模型中的显示名称不存在，则使用服务器返回的 DisplayName 属性。
+            if (!displayName && result[1]?.value?.value) {
               displayName = result[1].value.value.text;
             }
             
-            console.log(`读取节点值成功: ${value}, 显示名称: ${displayName}`);
+            console.log(`读取节点成功: ${nodeId}, 值: ${value}, 显示名称: ${displayName}, 数据类型: ${dataType}, 访问级别: ${accessLevel}`);
             
             ws.send(JSON.stringify({
               type: 'opcua-read-complete',
               requestId: data.requestId, // 包含requestId，以便前端能够正确处理响应
               deviceId: readDeviceId,
               nodeId,
+              status: 'success',
               value,
-              displayName
+              displayName,
+              dataType,
+              accessLevel
             }));
           } catch (error) {
             console.error('读取节点值失败:', error);
@@ -581,6 +730,8 @@ wss.on('connection', (ws) => {
           let connection = null;
           let finalValue = null;
           let resolvedNodeId = null;
+          let finalDataType = undefined;
+          let finalAccessLevel = undefined;
           
           try {
             connection = opcuaConnections.get(writeDeviceId);
@@ -596,7 +747,7 @@ wss.on('connection', (ws) => {
             // 首先读取节点的数据类型和当前值
             const readResult = await connection.session.read([{
               nodeId: resolvedNodeId,
-              attributeId: 13 // Value attribute
+              attributeId: AttributeIds.Value
             }]);
             
             let valueToWrite = writeValue;
@@ -680,24 +831,31 @@ wss.on('connection', (ws) => {
               
               // 读取节点值（如果没有从模型中获取到显示名称，再读取DisplayName属性）
               const attributesToRead = [
-                { nodeId: resolvedNodeId, attributeId: 13 } // Value attribute
+                { nodeId: resolvedNodeId, attributeId: AttributeIds.Value },
+                { nodeId: resolvedNodeId, attributeId: AttributeIds.DisplayName },
+                { nodeId: resolvedNodeId, attributeId: AttributeIds.DataType },
+                { nodeId: resolvedNodeId, attributeId: AttributeIds.AccessLevel }
               ];
-              
-              if (!finalDisplayName) {
-                attributesToRead.push({ nodeId: resolvedNodeId, attributeId: 3 }); // DisplayName attribute
-              }
               
               const verifyRead = await connection.session.read(attributesToRead);
               
               if (verifyRead && verifyRead[0] && verifyRead[0].value) {
                 finalValue = verifyRead[0].value.value;
-                console.log('读取到的最新值:', finalValue);
+                if (verifyRead[0].value.dataType) {
+                  finalDataType = verifyRead[0].value.dataType.toString();
+                }
+                console.log('Read latest node value:', finalValue);
               }
+
+              if (!finalDataType && verifyRead[2]?.value?.value) {
+                finalDataType = verifyRead[2].value.value.toString();
+              }
+
+              finalAccessLevel = formatAccessLevel(verifyRead[3]?.value?.value);
               
-              // 如果没有从模型中获取到显示名称，则使用服务器返回的
-              if (!finalDisplayName && verifyRead.length > 1 && verifyRead[1].value && verifyRead[1].value.value) {
+              if (!finalDisplayName && verifyRead[1]?.value?.value) {
                 finalDisplayName = verifyRead[1].value.value.text;
-                console.log('读取到的显示名称:', finalDisplayName);
+                console.log('Read displayName:', finalDisplayName);
               }
             }
           } catch (readError) {
@@ -713,6 +871,8 @@ wss.on('connection', (ws) => {
             status: finalValue !== null ? 'success' : 'error',
             value: finalValue,
             displayName: finalDisplayName,
+            dataType: finalDataType,
+            accessLevel: finalAccessLevel,
             errorMessage: finalValue !== null ? undefined : '读取值失败'
           }));
           
@@ -820,47 +980,89 @@ function findNodeInModel(nodes, targetNodeId) {
   return null;
 }
 
-// 辅助函数：从保存的模型中获取显示名称
-function getDisplayNameFromModel(deviceId, nodeId) {
-  console.log(`从模型中获取显示名称 - DeviceId: ${deviceId}, NodeId: ${nodeId}`);
-  const model = opcuaModels.get(deviceId);
+// 错误处理
+function getNodeDisplayName(node) {
+  return node ? (node.displayName || node.browseName || null) : null;
+}
+
+function findDisplayNameInModel(model, nodeId, modelDeviceId) {
   if (!model) {
-    console.log(`未找到设备 ${deviceId} 的模型数据`);
     return null;
   }
-  console.log(`设备 ${deviceId} 的模型数据包含 ${model.length} 个根节点`);
-  
-  // 尝试直接查找
+
+  console.log(`Searching model displayName - DeviceId: ${modelDeviceId}, NodeId: ${nodeId}, RootCount: ${model.length}`);
+
   let node = findNodeInModel(model, nodeId);
-  
-  // 如果找不到，尝试转换为标准GUID格式
-  if (!node && nodeId.startsWith('ns=1;g=')) {
+
+  if (!node && typeof nodeId === 'string' && nodeId.startsWith('ns=1;g=')) {
     const guidPart = nodeId.substring(6);
-    console.log(`尝试转换GUID格式: ${guidPart}`);
-    
-    // 尝试不同的GUID格式变体
     const guidVariants = [
-      guidPart, // 原始格式
-      guidPart.toUpperCase(), // 全大写
-      guidPart.toLowerCase(), // 全小写
-      guidPart.replace(/-/g, ''), // 移除分隔符
-      guidPart.toUpperCase().replace(/-/g, '') // 全大写并移除分隔符
+      guidPart,
+      guidPart.toUpperCase(),
+      guidPart.toLowerCase(),
+      guidPart.replace(/-/g, ''),
+      guidPart.toUpperCase().replace(/-/g, '')
     ];
-    
+
     for (const variant of guidVariants) {
       const variantNodeId = `ns=1;g=${variant}`;
-      console.log(`尝试变体: ${variantNodeId}`);
+      console.log(`Trying GUID variant: ${variantNodeId}`);
       node = findNodeInModel(model, variantNodeId);
       if (node) break;
     }
   }
-  
-  const displayName = node ? node.displayName : null;
-  console.log(`获取到的显示名称: ${displayName}`);
+
+  const displayName = getNodeDisplayName(node);
+  console.log(`Model displayName result: ${displayName}`);
   return displayName;
 }
 
-// 错误处理
+function getDisplayNameFromModel(deviceId, nodeId) {
+  console.log(`Get displayName from model - DeviceId: ${deviceId}, NodeId: ${nodeId}`);
+
+  const model = opcuaModels.get(deviceId);
+  if (model) {
+    const displayName = findDisplayNameInModel(model, nodeId, deviceId);
+    if (displayName) {
+      return displayName;
+    }
+  } else {
+    console.log(`No model found for device ${deviceId}`);
+  }
+
+  const currentConnection = opcuaConnections.get(deviceId);
+  const currentEndpoint = currentConnection ? currentConnection.endpoint : null;
+  if (!currentEndpoint) {
+    console.log(`No endpoint found for device ${deviceId}, cannot search peer models`);
+    return null;
+  }
+
+  for (const [candidateDeviceId, connection] of opcuaConnections.entries()) {
+    if (candidateDeviceId === deviceId) {
+      continue;
+    }
+
+    if (!connection || connection.endpoint !== currentEndpoint) {
+      continue;
+    }
+
+    const candidateModel = opcuaModels.get(candidateDeviceId);
+    if (!candidateModel) {
+      console.log(`Peer device ${candidateDeviceId} has same endpoint but no model`);
+      continue;
+    }
+
+    console.log(`Trying peer model with same endpoint - SourceDeviceId: ${candidateDeviceId}`);
+    const displayName = findDisplayNameInModel(candidateModel, nodeId, candidateDeviceId);
+    if (displayName) {
+      return displayName;
+    }
+  }
+
+  console.log('No displayName found in current or same-endpoint models');
+  return null;
+}
+
 udpSocket.on('error', (error) => {
   console.error('UDP socket error:', error);
 });
@@ -906,37 +1108,39 @@ async function recursiveBrowse(session, nodeId, depth = 0, visitedNodeIds = new 
           const readValues = [
             {
               nodeId: ref.nodeId,
-              attributeId: 13 // Value attribute
+              attributeId: AttributeIds.Value
             },
             {
               nodeId: ref.nodeId,
-              attributeId: 12 // AccessLevel attribute
+              attributeId: AttributeIds.AccessLevel
             }
           ];
           
           const readResults = await session.read(readValues);
           
-          // 读取值
           if (readResults && readResults[0] && readResults[0].value && readResults[0].value.value !== undefined) {
             childNode.value = readResults[0].value.value;
             childNode.dataType = readResults[0].value.dataType ? readResults[0].value.dataType.toString() : undefined;
-            console.log(`  变量值: ${childNode.value} (数据类型: ${childNode.dataType})`);
+            console.log(`  ???: ${childNode.value} (????: ${childNode.dataType})`);
           }
-          
-          // 读取访问级别
+
+          const valueStatus = readResults?.[0]?.statusCode?.toString?.() || 'Unknown';
+          const accessStatus = readResults?.[1]?.statusCode?.toString?.() || 'Unknown';
+          let accessLevelValue;
+          let accessLevelStr;
+
           if (readResults && readResults[1] && readResults[1].value && readResults[1].value.value !== undefined) {
-            const accessLevelValue = readResults[1].value.value;
-            // 解析访问级别：0=无访问权限，1=可读，2=可写，3=可读可写
-            let accessLevelStr = "";
-            if ((accessLevelValue & 1) === 1) accessLevelStr = "Read";
-            if ((accessLevelValue & 2) === 2) {
-              if (accessLevelStr.length > 0) accessLevelStr = "ReadWrite";
-              else accessLevelStr = "Write";
+            accessLevelValue = readResults[1].value.value;
+            accessLevelStr = formatAccessLevel(accessLevelValue);
+            if (accessLevelStr) {
+              childNode.accessLevel = accessLevelStr;
+              console.log(`  ????: ${childNode.accessLevel} (???: ${accessLevelValue})`);
             }
-            if (accessLevelStr.length === 0) accessLevelStr = "None";
-            childNode.accessLevel = accessLevelStr;
-            console.log(`  访问级别: ${childNode.accessLevel} (原始值: ${accessLevelValue})`);
           }
+
+          console.log(
+            `[OPCUA-BROWSE-ACCESS] browseName="${childNode.browseName}" displayName="${childNode.displayName}" nodeId="${childNode.nodeId}" nodeClass="${childNode.nodeClass}" dataType="${childNode.dataType || '-'}" valueStatus="${valueStatus}" accessStatus="${accessStatus}" accessLevelRaw=${accessLevelValue ?? 'undefined'} accessLevel="${accessLevelStr ?? 'undefined'}" readWrite=${accessLevelStr === 'ReadWrite'}`
+          );
         } catch (readErr) {
           console.error(`读取节点 ${ref.nodeId.toString()} 值或访问级别失败:`, readErr);
         }
@@ -951,7 +1155,7 @@ async function recursiveBrowse(session, nodeId, depth = 0, visitedNodeIds = new 
       children.push(childNode);
     }
 
-    return children;
+    return sortOpcuaNodes(children);
   } catch (err) {
     console.error(`浏览节点 ${nodeId} 失败:`, err);
     return [];

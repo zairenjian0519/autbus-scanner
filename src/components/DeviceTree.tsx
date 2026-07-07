@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Tree, Menu, Popover, Space, Tag, message } from 'antd';
-import type { DataNode } from 'antd/es/tree';
+import { Tree, Menu, Popover, Space, Tag, message, Spin } from 'antd';
+import type { DataNode, EventDataNode } from 'antd/es/tree';
 import { SettingOutlined, GatewayOutlined, MonitorOutlined, LinkOutlined, CloseCircleOutlined, LoadingOutlined, AppstoreOutlined } from '@ant-design/icons';
 import type { AUTBUSDevice, DeviceType } from '../types/device';
 import { useDeviceStore, useDiscoveryService } from '../stores/deviceStore';
@@ -73,7 +73,6 @@ const DeviceTree: React.FC<DeviceTreeProps> = ({
         />
         {device.type === 'controller' && opcuaStatus && (
           <Tag 
-            size="small" 
             color={opcuaStatusColor[opcuaStatus]} 
             style={{ fontSize: 10, height: 16, lineHeight: '16px' }}
           >
@@ -109,13 +108,14 @@ const DeviceTree: React.FC<DeviceTreeProps> = ({
     }
   };
 
-  const handleContextMenu = (e: React.MouseEvent, node: DataNode) => {
-    e.preventDefault();
+  const handleContextMenu = (info: { event: React.MouseEvent; node: EventDataNode<DataNode> }) => {
+    info.event.preventDefault();
+    const node = info.node;
     const deviceNode = node as DataNode & { device?: AUTBUSDevice };
     if (deviceNode.device) {
       setContextMenu({
-        x: e.clientX,
-        y: e.clientY,
+        x: info.event.clientX,
+        y: info.event.clientY,
         device: deviceNode.device
       });
     }
@@ -181,22 +181,23 @@ const DeviceTree: React.FC<DeviceTreeProps> = ({
 
   return (
     <div className="device-tree-container">
-      <Tree
-        treeData={treeData}
-        selectedKeys={selectedKeys}
-        onSelect={handleSelect}
-        onRightClick={handleContextMenu}
-        defaultExpandAll
-        showIcon={false}
-        loading={loading}
-        titleRender={(nodeData: DataNode) => {
-          const dataNode = nodeData as DataNode & { device?: AUTBUSDevice };
-          if (dataNode.device) {
-            return getDeviceTitle(dataNode.device);
-          }
-          return String(nodeData.title || '');
-        }}
-      />
+      <Spin spinning={Boolean(loading)}>
+        <Tree
+          treeData={treeData}
+          selectedKeys={selectedKeys}
+          onSelect={handleSelect}
+          onRightClick={handleContextMenu}
+          defaultExpandAll
+          showIcon={false}
+          titleRender={(nodeData: DataNode) => {
+            const dataNode = nodeData as DataNode & { device?: AUTBUSDevice };
+            if (dataNode.device) {
+              return getDeviceTitle(dataNode.device);
+            }
+            return String(nodeData.title || '');
+          }}
+        />
+      </Spin>
       {treeMenu}
     </div>
   );

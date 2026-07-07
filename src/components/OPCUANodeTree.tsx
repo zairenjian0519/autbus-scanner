@@ -5,13 +5,16 @@ import { FolderOutlined, FileOutlined, AppstoreOutlined, KeyOutlined, ReloadOutl
 import type { OPCUANode } from '../types/device';
 import { opcuaService } from '../services/opcuaService';
 import { useDeviceStore } from '../stores/deviceStore';
+import { hasReadWriteAccess } from '../utils/opcuaAccess';
 
 interface OPCUANodeTreeProps {
   nodes: OPCUANode[];
   loading?: boolean;
   onNodeSelect?: (node: OPCUANode) => void;
-  onRefresh?: () => void;
+  onRefresh?: (node: OPCUANode) => void;
   refreshing?: boolean;
+  onRefreshModel?: () => void;
+  refreshingModel?: boolean;
 }
 
 type OPCUATreeDataNode = DataNode & {
@@ -23,6 +26,35 @@ type OPCUATreeDataNode = DataNode & {
 const TREE_FONT_SIZE = 12;
 const DETAIL_FONT_SIZE = 13;
 const CODE_FONT_SIZE = 12;
+const nodeNameCollator = new Intl.Collator('zh-CN', {
+  numeric: true,
+  sensitivity: 'base'
+});
+
+const isVariableNode = (node: OPCUANode): boolean => {
+  const nodeClass = String(node.nodeClass || '').toLowerCase();
+  return nodeClass === 'variable' || nodeClass === '2';
+};
+
+const canWriteNode = (node: OPCUANode): boolean => {
+  if (!isVariableNode(node)) {
+    return false;
+  }
+
+  return hasReadWriteAccess(node.accessLevel);
+};
+
+const renderReadOnlyValue = (value: any): React.ReactNode => {
+  if (value === undefined || value === null || value === '') {
+    return '-';
+  }
+
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+
+  return String(value);
+};
 
 const nodeTreeCardStyle: React.CSSProperties = {
   height: 'calc(100vh - 300px)',
@@ -113,7 +145,9 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   loading = false,
   onNodeSelect,
   onRefresh,
-  refreshing = false
+  refreshing = false,
+  onRefreshModel,
+  refreshingModel = false
 }) => {
   const [selectedNode, setSelectedNode] = useState<OPCUANode | null>(null);
   const [selectedNodeKey, setSelectedNodeKey] = useState<string | null>(null);
@@ -122,7 +156,7 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   
   // 从设备存储中获取当前选中的设备ID
-  const { selectedDevice } = useDeviceStore();
+  const { selectedDevice, updateOPCUANode } = useDeviceStore();
   
   // 监听选中设备的变化
   useEffect(() => {
@@ -192,6 +226,24 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
     return parentKey ? `${parentKey}/${pathPart}` : pathPart;
   };
 
+  const getSortableNodeName = (node: OPCUANode): string => {
+    return node.browseName || node.displayName || node.nodeId;
+  };
+
+  const sortNodesByName = (nodeList: OPCUANode[]): OPCUANode[] => {
+    return [...nodeList]
+      .sort((left, right) => nodeNameCollator.compare(
+        getSortableNodeName(left),
+        getSortableNodeName(right)
+      ))
+      .map((node) => ({
+        ...node,
+        children: node.children && node.children.length > 0
+          ? sortNodesByName(node.children)
+          : node.children
+      }));
+  };
+
   const findNodeByTreeKey = (
     nodeList: OPCUANode[],
     targetKey: string,
@@ -240,7 +292,8 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
     });
   };
 
-  const treeData = useMemo(() => convertToTreeData(nodes), [nodes]);
+  const sortedNodes = useMemo(() => sortNodesByName(nodes), [nodes]);
+  const treeData = useMemo(() => convertToTreeData(sortedNodes), [sortedNodes]);
   const expandableKeys = useMemo(() => {
     const keys: string[] = [];
     const collectKeys = (treeNodes: OPCUATreeDataNode[]) => {
@@ -262,17 +315,16 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
       return;
     }
 
-    const updatedNode = findNodeByTreeKey(nodes, selectedNodeKey);
+    const updatedNode = findNodeByTreeKey(sortedNodes, selectedNodeKey);
     if (updatedNode) {
       setSelectedNode(updatedNode);
-      setEditValue(updatedNode.value);
       console.log(`节点 ${updatedNode.browseName} 的数据已更新: ${updatedNode.value}`);
     } else {
       setSelectedNode(null);
       setSelectedNodeKey(null);
       setEditValue(null);
     }
-  }, [nodes, selectedNodeKey]);
+  }, [sortedNodes, selectedNodeKey]);
 
   const handleSelect = (_selectedKeys: React.Key[], info: { node: DataNode }) => {
     const node = info.node as OPCUATreeDataNode;
@@ -289,84 +341,71 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
   };
 
   // 处理值修改
+  // Handle value edits without auto-submitting boolean changes.
   const handleValueChange = (value: any) => {
     setEditValue(value);
-    
-    // 如果是布尔类型，立即提交
-    if (selectedNode) {
-      const dataTypeLower = selectedNode.dataType?.toLowerCase() || '';
-      if (dataTypeLower.includes('boolean') || dataTypeLower.includes('bool')) {
-        handleSubmitValue(selectedNode);
-      }
-    }
   };
 
-  // 提交值修改
-  const handleSubmitValue = async (node: OPCUANode) => {
+  const handleSubmitValue = async (node: OPCUANode, valueToSubmit = editValue) => {
     if (!currentDeviceId) {
-      console.error('未连接到设备，无法写入值');
+      console.error('No connected device, unable to write value');
+      return;
+    }
+
+    if (!canWriteNode(node)) {
+      console.error('Current node is not writable, write blocked');
       return;
     }
     
     try {
-      const result = await opcuaService.writeNodeValue(node.nodeId, editValue, currentDeviceId);
+      const result = await opcuaService.writeNodeValue(node.nodeId, valueToSubmit, currentDeviceId);
+      console.log('Write result:', result);
       
-      console.log('写入操作返回结果:', result);
-      
-      // 使用后端返回的最新值
       if (result.value !== undefined) {
-        console.log('使用后端返回的最新值:', result.value);
-        
-        // 更新节点值
-        if (selectedNode) {
-          const updatedNode = { ...selectedNode, value: result.value };
-          setSelectedNode(updatedNode);
-          setEditValue(result.value);
-        }
+        const updatedNode: OPCUANode = {
+          ...node,
+          value: result.value,
+          ...(result.displayName ? { displayName: result.displayName } : {}),
+          ...(result.dataType ? { dataType: result.dataType } : {}),
+          ...(result.accessLevel ? { accessLevel: result.accessLevel } : {})
+        };
+
+        setSelectedNode(updatedNode);
+        setEditValue(result.value);
+        updateOPCUANode(currentDeviceId, node.nodeId, updatedNode);
       }
     } catch (error) {
-      console.error('写入节点值失败:', error);
+      console.error('Failed to write node value:', error);
     }
   };
 
-  // 处理回车键提交
   const handleKeyPress = async (e: React.KeyboardEvent, node: OPCUANode) => {
     if (e.key === 'Enter') {
       await handleSubmitValue(node);
     }
   };
 
-  // 根据数据类型渲染输入控件
-  const renderInputControl = (node: OPCUANode) => {
-    // 调试信息
-    console.log('节点信息:', {
+  const renderEditControl = (node: OPCUANode) => {
+    console.log('Node info:', {
       nodeId: node.nodeId,
       dataType: node.dataType,
       accessLevel: node.accessLevel,
       value: node.value
     });
 
-    // 所有变量都可编辑，不判断权限
+    if (!canWriteNode(node)) {
+      return null;
+    }
 
-    // 根据数据类型渲染对应的输入控件
     let inputComponent;
-    let showSubmitButton = true;
-
-    // 将 dataType 转换为字符串进行判断
     const dataTypeStr = String(node.dataType || '').toLowerCase();
-    
-    // 判断是否为数字类型（包括数字类型的枚举值）
     const isNumberType = dataTypeStr.includes('double') || dataTypeStr.includes('float') || 
                         dataTypeStr.includes('int') || dataTypeStr.includes('integer') || 
                         dataTypeStr.includes('number') || dataTypeStr === '6' || dataTypeStr === '5' || 
                         dataTypeStr === '2' || dataTypeStr === '3' || dataTypeStr === '4' ||
-                        // 根据当前值的类型判断
                         typeof node.value === 'number';
-    
-    // 判断是否为布尔类型
     const isBooleanType = dataTypeStr.includes('boolean') || dataTypeStr.includes('bool') || 
                          dataTypeStr === '1' ||
-                         // 根据当前值的类型判断
                          typeof node.value === 'boolean';
 
     if (isNumberType) {
@@ -383,25 +422,22 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
         <div style={{ display: 'flex', alignItems: 'center' }}>
           <Switch
             checked={editValue === true}
-            onChange={handleValueChange}
+            onChange={(checked) => handleValueChange(checked)}
             size="small"
           />
           <span style={{ marginLeft: 8, fontSize: DETAIL_FONT_SIZE }}>
-            {editValue === true ? '开' : '关'}
+            {editValue === true ? '\u5f00' : '\u5173'}
           </span>
         </div>
       );
-      // 对于布尔类型，切换时立即提交
-      showSubmitButton = false;
     } else {
-      // 字符串或其他类型
       inputComponent = (
         <Input
           value={editValue}
           onChange={(e) => handleValueChange(e.target.value)}
           onKeyPress={(e) => handleKeyPress(e, node)}
           style={{ width: '100%', fontSize: DETAIL_FONT_SIZE }}
-          placeholder="请输入新值"
+          placeholder={'\u8bf7\u8f93\u5165\u65b0\u503c'}
         />
       );
     }
@@ -409,34 +445,50 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
         <div>{inputComponent}</div>
-        {showSubmitButton && (
-          <Button 
-            type="primary" 
-            size="small"
-            onClick={() => handleSubmitValue(node)}
-            style={{ fontSize: TREE_FONT_SIZE, padding: '4px 10px', alignSelf: 'flex-end' }}
-          >
-            确认修改
-          </Button>
-        )}
+        <Button 
+          type="primary" 
+          size="small"
+          onClick={() => handleSubmitValue(node)}
+          style={{ fontSize: TREE_FONT_SIZE, padding: '4px 10px', alignSelf: 'flex-end' }}
+        >
+          {'\u786e\u8ba4\u4fee\u6539'}
+        </Button>
       </div>
     );
   };
 
   return (
     <Card
-      title="AUTBUS 总线设备树"
+      title={
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span>AUTBUS 总线设备树</span>
+          {onRefreshModel ? (
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={onRefreshModel}
+              disabled={refreshing}
+              loading={refreshingModel}
+            >
+              {'\u5237\u65b0\u6a21\u578b'}
+            </Button>
+          ) : null}
+        </div>
+      }
       extra={
-        onRefresh ? (
-          <Button
-            size="small"
-            icon={<ReloadOutlined />}
-            onClick={onRefresh}
-            loading={refreshing}
-          >
-            刷新点表
-          </Button>
-        ) : null
+        <div style={{ display: 'flex', gap: 8 }}>
+          {onRefresh ? (
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={() => selectedNode && onRefresh(selectedNode)}
+              disabled={!selectedNode || refreshingModel}
+              loading={refreshing}
+            >
+              {'\u5237\u65b0\u8282\u70b9'}
+            </Button>
+          ) : null}
+        </div>
       }
       style={nodeTreeCardStyle}
       bodyStyle={nodeTreeCardBodyStyle}
@@ -474,8 +526,13 @@ const OPCUANodeTree: React.FC<OPCUANodeTreeProps> = ({
                   </Descriptions.Item>
                 )}
                 <Descriptions.Item label="当前值" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
-                  {renderInputControl(selectedNode)}
+                  {renderReadOnlyValue(selectedNode.value)}
                 </Descriptions.Item>
+                {canWriteNode(selectedNode) && (
+                  <Descriptions.Item label="修改值" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
+                    {renderEditControl(selectedNode)}
+                  </Descriptions.Item>
+                )}
                 {selectedNode.accessLevel && (
                   <Descriptions.Item label="访问级别" labelStyle={detailLabelStyle} contentStyle={detailContentStyle}>
                     {selectedNode.accessLevel}

@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import { Input, InputNumber, Switch, Button } from 'antd';
 import { opcuaService } from '../services/opcuaService';
+import { hasReadWriteAccess } from '../utils/opcuaAccess';
 
 interface NodeInfo {
   nodeId: string;
   dataType: string;
   value: any;
   displayName: string;
+  accessLevel?: string;
 }
 
 // IPv6地址格式化函数：将简写格式转换为完整格式
@@ -40,6 +42,27 @@ const formatIPv6Address = (ipv6: string): string => {
   }
 };
 
+const buildDirectDeviceId = (formattedIPv6: string): string => {
+  return `direct_${formattedIPv6.replace(/:/g, '')}`;
+};
+
+const buildNodeIdFromIPv6 = (formattedIPv6: string): string => {
+  const ipv6NoColons = formattedIPv6.replace(/:/g, '');
+  const uuidStr = `${ipv6NoColons.slice(0, 8)}-${ipv6NoColons.slice(8, 12)}-${ipv6NoColons.slice(12, 16)}-${ipv6NoColons.slice(16, 20)}-${ipv6NoColons.slice(20)}`;
+  return `ns=1;g=${uuidStr}`;
+};
+
+const buildFallbackDisplayName = (formattedIPv6: string): string => {
+  const ipv6Parts = formattedIPv6.split(':');
+  return `设备变量_${ipv6Parts[6]}_${ipv6Parts[7]}`;
+};
+
+const inferDataType = (value: any): string => {
+  if (typeof value === 'number') return 'Double';
+  if (typeof value === 'boolean') return 'Boolean';
+  return 'String';
+};
+
 const ObjectDirectOperation: React.FC = () => {
   const [ipv6Address, setIpv6Address] = useState('');
   const [nodeInfo, setNodeInfo] = useState<NodeInfo | null>(null);
@@ -67,7 +90,7 @@ const ObjectDirectOperation: React.FC = () => {
       const endpointUrl = `opc.tcp://[${formattedIPv6}]:4840`;
       
       // 使用稳定ID，让同一个IPv6地址复用后端已有的OPC UA连接
-      const newDeviceId = `direct_${formattedIPv6.replace(/:/g, '')}`;
+      const newDeviceId = buildDirectDeviceId(formattedIPv6);
       setDeviceId(newDeviceId);
 
       console.log('连接到 OPC UA 服务器:', endpointUrl);
@@ -80,40 +103,38 @@ const ObjectDirectOperation: React.FC = () => {
       
       console.log('连接成功，浏览节点树...');
 
-      // 构建完整的 NodeId（使用 guid 格式，将 IPv6 转换为 UUID 格式）
-      const ipv6NoColons = formattedIPv6.replace(/:/g, '');
-      // IPv6 是 128 位，UUID 也是 128 位，直接格式化为 UUID 格式
-      const uuidStr = `${ipv6NoColons.slice(0, 8)}-${ipv6NoColons.slice(8, 12)}-${ipv6NoColons.slice(12, 16)}-${ipv6NoColons.slice(16, 20)}-${ipv6NoColons.slice(20)}`;
-      const fullNodeId = `ns=1;g=${uuidStr}`;
+      const fullNodeId = buildNodeIdFromIPv6(formattedIPv6);
       
       console.log('读取节点值:', fullNodeId);
 
       // 读取节点值
-      const result = await opcuaService.readNodeValue(fullNodeId, newDeviceId);
+      let result = await opcuaService.readNodeValue(fullNodeId, newDeviceId);
 
       console.log('读取成功:', result);
 
       // 简化处理，直接读取值并尝试推断类型
-      const dataType = typeof result.value === 'number' ? 'Double' :
-                      typeof result.value === 'boolean' ? 'Boolean' : 'String';
-
       // 生成变量显示名称
-      let displayName: string;
+      let displayName = result.displayName;
       
-      // 优先使用OPC UA服务器返回的displayName
-      if (result.displayName) {
-        displayName = result.displayName;
-      } else {
-        // 默认命名规则：基于IPv6地址的最后两个部分
-        const ipv6Parts = formattedIPv6.split(':');
-        displayName = `设备变量_${ipv6Parts[6]}_${ipv6Parts[7]}`;
+      if (!displayName) {
+        try {
+          console.log('未读取到显示名称，开始刷新OPC UA点表:', newDeviceId);
+          await opcuaService.browseNodes(newDeviceId);
+          const refreshedResult = await opcuaService.readNodeValue(fullNodeId, newDeviceId);
+          result = refreshedResult;
+          displayName = refreshedResult.displayName;
+          console.log('点表刷新后读取结果:', refreshedResult);
+        } catch (browseError) {
+          console.warn('刷新点表或重新读取显示名称失败，使用默认显示名称:', browseError);
+        }
       }
 
       const info: NodeInfo = {
         nodeId: formattedIPv6,
-        dataType,
+        dataType: result.dataType || inferDataType(result.value),
         value: result.value,
-        displayName
+        displayName: displayName || buildFallbackDisplayName(formattedIPv6),
+        accessLevel: result.accessLevel
       };
 
       setNodeInfo(info);
@@ -134,16 +155,17 @@ const ObjectDirectOperation: React.FC = () => {
       return;
     }
 
+    if (!hasReadWriteAccess(nodeInfo.accessLevel)) {
+      setError('当前对象不是可读写节点，不能修改');
+      return;
+    }
+
     setIsLoading(true);
     setError('');
     setSuccess('');
 
     try {
-      // 构建完整的 NodeId（使用 guid 格式，将 IPv6 转换为 UUID 格式）
-      const ipv6NoColons = nodeInfo.nodeId.replace(/:/g, '');
-      // IPv6 是 128 位，UUID 也是 128 位，直接格式化为 UUID 格式
-      const uuidStr = `${ipv6NoColons.slice(0, 8)}-${ipv6NoColons.slice(8, 12)}-${ipv6NoColons.slice(12, 16)}-${ipv6NoColons.slice(16, 20)}-${ipv6NoColons.slice(20)}`;
-      const fullNodeId = `ns=1;g=${uuidStr}`;
+      const fullNodeId = buildNodeIdFromIPv6(nodeInfo.nodeId);
 
       console.log('写入节点值:', fullNodeId, editValue);
 
@@ -158,7 +180,9 @@ const ObjectDirectOperation: React.FC = () => {
           ...prev, 
           value: result.value,
           // 如果返回了displayName，则更新显示名称
-          ...(result.displayName ? { displayName: result.displayName } : {})
+          ...(result.displayName ? { displayName: result.displayName } : {}),
+          ...(result.dataType ? { dataType: result.dataType } : {}),
+          ...(result.accessLevel ? { accessLevel: result.accessLevel } : {})
         } : null);
         setEditValue(result.value);
         setSuccess('操作完成，已刷新最新值');
@@ -177,11 +201,17 @@ const ObjectDirectOperation: React.FC = () => {
   const renderInputControl = () => {
     if (!nodeInfo) return null;
 
+    if (!hasReadWriteAccess(nodeInfo.accessLevel)) {
+      return null;
+    }
+
     const dataTypeLower = nodeInfo.dataType.toLowerCase();
     
     if (dataTypeLower.includes('double') || dataTypeLower.includes('float') || 
         dataTypeLower.includes('int') || dataTypeLower.includes('integer') || 
-        dataTypeLower.includes('number')) {
+        dataTypeLower.includes('number') || dataTypeLower === '6' || dataTypeLower === '5' ||
+        dataTypeLower === '2' || dataTypeLower === '3' || dataTypeLower === '4' ||
+        typeof nodeInfo.value === 'number') {
       return (
         <InputNumber
           value={editValue}
@@ -190,7 +220,8 @@ const ObjectDirectOperation: React.FC = () => {
           placeholder="请输入数字"
         />
       );
-    } else if (dataTypeLower.includes('boolean') || dataTypeLower.includes('bool')) {
+    } else if (dataTypeLower.includes('boolean') || dataTypeLower.includes('bool') ||
+               dataTypeLower === '1' || typeof nodeInfo.value === 'boolean') {
       return (
         <div style={{ marginBottom: '10px' }}>
           <Switch
@@ -234,6 +265,8 @@ const ObjectDirectOperation: React.FC = () => {
         return value;
     }
   };
+
+  const canModifyNode = nodeInfo ? hasReadWriteAccess(nodeInfo.accessLevel) : false;
 
   return (
     <div className="object-direct-operation">
@@ -284,14 +317,20 @@ const ObjectDirectOperation: React.FC = () => {
             <span className="label">当前值：</span>
             <span>{renderDisplayValue(nodeInfo.value, nodeInfo.dataType)}</span>
           </div>
-
-          <div className="modify-section">
-            <h4>修改值</h4>
-            {renderInputControl()}
-            <Button type="primary" onClick={handleModify} loading={isLoading}>
-              确认修改
-            </Button>
+          <div className="info-item">
+            <span className="label">访问级别：</span>
+            <span>{nodeInfo.accessLevel || '未知'}</span>
           </div>
+
+          {canModifyNode && (
+            <div className="modify-section">
+              <h4>修改值</h4>
+              {renderInputControl()}
+              <Button type="primary" onClick={handleModify} loading={isLoading}>
+                确认修改
+              </Button>
+            </div>
+          )}
         </div>
       )}
 

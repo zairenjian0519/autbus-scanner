@@ -1,5 +1,7 @@
 import type { OPCUANode, OPCUAConnection } from '../types/device';
 
+export type OPCUANodeReadResult = Pick<OPCUANode, 'value' | 'displayName' | 'dataType' | 'accessLevel'>;
+
 export class OPCUAService {
   private ws: WebSocket | null = null;
   private callbacks: Map<string, (data: any) => void> = new Map();
@@ -177,7 +179,7 @@ export class OPCUAService {
   }
 
   // 读取节点值
-  async readNodeValue(nodeId: string, deviceId?: string): Promise<{ value: any; displayName?: string }> {
+  async readNodeValue(nodeId: string, deviceId?: string): Promise<OPCUANodeReadResult> {
     console.log(`读取节点值: ${nodeId}`);
 
     try {
@@ -190,10 +192,12 @@ export class OPCUAService {
       
       console.log('读取节点值响应:', result);
       
-      if (result.value !== undefined) {
+      if (result.status === 'success' || result.value !== undefined || result.displayName !== undefined) {
         return {
           value: result.value,
-          displayName: result.displayName
+          displayName: result.displayName,
+          dataType: result.dataType,
+          accessLevel: result.accessLevel
         };
       } else {
         throw new Error(result.errorMessage || '读取失败');
@@ -205,7 +209,7 @@ export class OPCUAService {
   }
 
   // 写入节点值
-  async writeNodeValue(nodeId: string, value: any, deviceId?: string): Promise<{ value: any; displayName?: string }> {
+  async writeNodeValue(nodeId: string, value: any, deviceId?: string): Promise<OPCUANodeReadResult> {
     console.log(`写入节点值: ${nodeId} = ${value}`);
 
     try {
@@ -219,7 +223,9 @@ export class OPCUAService {
       console.log('写入操作响应:', result);
       return {
         value: result.value,
-        displayName: result.displayName
+        displayName: result.displayName,
+        dataType: result.dataType,
+        accessLevel: result.accessLevel
       };
     } catch (error) {
       console.error('写入节点值失败:', error);

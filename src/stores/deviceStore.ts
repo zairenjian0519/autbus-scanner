@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AUTBUSDevice, DiscoveryConfig, NetworkInterface, OPCUAConnection } from '../types/device';
+import type { AUTBUSDevice, DiscoveryConfig, NetworkInterface, OPCUAConnection, OPCUANode } from '../types/device';
 import { networkService } from '../services/networkService';
 import { opcuaService } from '../services/opcuaService';
 
@@ -8,6 +8,44 @@ const DISCOVERY_CONFIG: DiscoveryConfig = {
   etherType: 0xB62C,
   port: 4840,
   udpPort: 6060
+};
+
+const mergeNodeUpdates = (
+  nodes: OPCUANode[] | undefined,
+  targetNodeId: string,
+  updates: Partial<OPCUANode>
+): OPCUANode[] | undefined => {
+  if (!nodes) {
+    return nodes;
+  }
+
+  let changed = false;
+
+  const nextNodes = nodes.map((node) => {
+    const nextChildren = mergeNodeUpdates(node.children, targetNodeId, updates);
+    const childrenChanged = nextChildren !== node.children;
+
+    if (node.nodeId === targetNodeId) {
+      changed = true;
+      return {
+        ...node,
+        ...updates,
+        children: childrenChanged ? nextChildren : node.children
+      };
+    }
+
+    if (childrenChanged) {
+      changed = true;
+      return {
+        ...node,
+        children: nextChildren
+      };
+    }
+
+    return node;
+  });
+
+  return changed ? nextNodes : nodes;
 };
 
 interface DeviceState {
@@ -35,6 +73,7 @@ interface DeviceState {
   loadNetworkInterfaces: () => Promise<void>;
   setOPCUAConnection: (connection: OPCUAConnection) => void;
   updateOPCUAConnection: (deviceId: string, updates: Partial<OPCUAConnection>) => void;
+  updateOPCUANode: (deviceId: string, nodeId: string, updates: Partial<OPCUANode>) => void;
   removeOPCUAConnection: (deviceId: string) => void;
   getOPCUAConnection: (deviceId: string) => OPCUAConnection | undefined;
   // 添加定时器相关方法
@@ -246,6 +285,17 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
     )
   })),
 
+  updateOPCUANode: (deviceId, nodeId, updates) => set((state) => ({
+    opcuaConnections: state.opcuaConnections.map((connection) => {
+      if (connection.deviceId !== deviceId) {
+        return connection;
+      }
+
+      const nodes = mergeNodeUpdates(connection.nodes, nodeId, updates);
+      return nodes === connection.nodes ? connection : { ...connection, nodes };
+    })
+  })),
+
   removeOPCUAConnection: (deviceId) => set((state) => ({
     opcuaConnections: state.opcuaConnections.filter(c => c.deviceId !== deviceId)
   })),
@@ -355,6 +405,9 @@ export const useDiscoveryService = () => {
                     if (result && result.value !== undefined) {
                       // 更新节点值
                       node.value = result.value;
+                      if (result.displayName) node.displayName = result.displayName;
+                      if (result.dataType) node.dataType = result.dataType;
+                      if (result.accessLevel) node.accessLevel = result.accessLevel;
                       console.log(`更新节点值: ${node.browseName} = ${result.value}`);
                     }
                   } catch (readError) {
@@ -400,11 +453,36 @@ export const useDiscoveryService = () => {
     }
   };
 
+  const refreshDeviceNode = async (deviceId: string, nodeId: string) => {
+    const connection = useDeviceStore.getState().getOPCUAConnection(deviceId);
+
+    if (!connection || connection.status !== 'connected') {
+      throw new Error('OPC UA未连接，无法刷新节点');
+    }
+
+    const result = await opcuaService.readNodeValue(nodeId, deviceId);
+    const updates: Partial<OPCUANode> = {
+      ...(result.value !== undefined ? { value: result.value } : {}),
+      ...(result.displayName ? { displayName: result.displayName } : {}),
+      ...(result.dataType ? { dataType: result.dataType } : {}),
+      ...(result.accessLevel ? { accessLevel: result.accessLevel } : {})
+    };
+
+    useDeviceStore.getState().updateOPCUANode(deviceId, nodeId, updates);
+    useDeviceStore.getState().updateOPCUAConnection(deviceId, {
+      status: 'connected',
+      errorMessage: undefined
+    });
+
+    console.log(`设备 ${deviceId} 节点 ${nodeId} 刷新完成`);
+    return updates;
+  };
+
   const refreshDeviceNodes = async (deviceId: string) => {
     const connection = useDeviceStore.getState().getOPCUAConnection(deviceId);
 
     if (!connection || connection.status !== 'connected') {
-      throw new Error('OPC UA未连接，无法刷新点表');
+      throw new Error('OPC UA未连接，无法刷新模型');
     }
 
     const nodes = await opcuaService.browseNodes(deviceId);
@@ -414,7 +492,7 @@ export const useDiscoveryService = () => {
       errorMessage: undefined
     });
 
-    console.log(`设备 ${deviceId} 点表刷新完成，发现 ${nodes.length} 个根节点`);
+    console.log(`设备 ${deviceId} 全量模型刷新完成，发现 ${nodes.length} 个根节点`);
     return nodes;
   };
 
@@ -436,6 +514,7 @@ export const useDiscoveryService = () => {
   return {
     startDiscovery,
     connectToDevice,
+    refreshDeviceNode,
     refreshDeviceNodes,
     disconnectDevice,
     config: discoveryConfig

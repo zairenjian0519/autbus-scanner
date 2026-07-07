@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Card, Descriptions, Tag, Space, Button, Empty, message } from 'antd';
 import { WifiOutlined, DisconnectOutlined, SyncOutlined } from '@ant-design/icons';
-import type { AUTBUSDevice } from '../types/device';
+import type { AUTBUSDevice, OPCUANode } from '../types/device';
 import PropertyTable from './PropertyTable';
 import OPCUANodeTree from './OPCUANodeTree';
 import { useDeviceStore, useDiscoveryService } from '../stores/deviceStore';
@@ -13,8 +13,9 @@ interface DeviceDetailsProps {
 
 const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
   const { getOPCUAConnection } = useDeviceStore();
-  const { connectToDevice, disconnectDevice, refreshDeviceNodes } = useDiscoveryService();
-  const [refreshingNodes, setRefreshingNodes] = useState(false);
+  const { connectToDevice, disconnectDevice, refreshDeviceNode, refreshDeviceNodes } = useDiscoveryService();
+  const [refreshingNode, setRefreshingNode] = useState(false);
+  const [refreshingModel, setRefreshingModel] = useState(false);
   const opcuaConnection = device ? getOPCUAConnection(device.id) : undefined;
 
   if (!device) {
@@ -37,19 +38,35 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
     }
   };
 
-  const handleRefreshNodes = async () => {
-    if (refreshingNodes) {
+  const handleRefreshNode = async (node: OPCUANode) => {
+    if (refreshingNode) {
       return;
     }
 
-    setRefreshingNodes(true);
+    setRefreshingNode(true);
+    try {
+      await refreshDeviceNode(device.id, node.nodeId);
+      message.success('当前节点刷新完成');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '刷新节点失败');
+    } finally {
+      setRefreshingNode(false);
+    }
+  };
+
+  const handleRefreshModel = async () => {
+    if (refreshingModel) {
+      return;
+    }
+
+    setRefreshingModel(true);
     try {
       const nodes = await refreshDeviceNodes(device.id);
-      message.success(`点表刷新完成，共 ${nodes.length} 个根节点`);
+      message.success(`全量模型刷新完成，共 ${nodes.length} 个根节点`);
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '刷新点表失败');
+      message.error(error instanceof Error ? error.message : '刷新模型失败');
     } finally {
-      setRefreshingNodes(false);
+      setRefreshingModel(false);
     }
   };
 
@@ -158,9 +175,11 @@ const DeviceDetails: React.FC<DeviceDetailsProps> = ({ device, loading }) => {
             <Card title="AUTBUS 总线">
               <OPCUANodeTree 
                 nodes={opcuaConnection.nodes || []} 
-                loading={loading || refreshingNodes}
-                onRefresh={handleRefreshNodes}
-                refreshing={refreshingNodes}
+                loading={loading || refreshingNode || refreshingModel}
+                onRefresh={handleRefreshNode}
+                refreshing={refreshingNode}
+                onRefreshModel={handleRefreshModel}
+                refreshingModel={refreshingModel}
               />
             </Card>
           )}

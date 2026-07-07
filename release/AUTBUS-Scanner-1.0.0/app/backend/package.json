@@ -1,0 +1,23 @@
+{
+  "name": "autbus-scanner-backend",
+  "version": "1.0.0",
+  "description": "Backend service for AUTBUS device discovery",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "node-opcua-client": "^2.169.0",
+    "ws": "^8.14.2"
+  },
+  "keywords": [
+    "autbus",
+    "device-discovery",
+    "udp",
+    "ipv6",
+    "multicast"
+  ],
+  "author": "",
+  "license": "MIT"
+}
